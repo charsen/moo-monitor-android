@@ -2,6 +2,15 @@
 
 > 2026-11-09 收口。本文件只记「还没做」；已验证的事实进 `NOTES.md`，接手与排障看 `HANDOFF.md`。
 
+## 明天从这里开始（2026-11-10）
+
+- [ ] **推送待授权**：`main` 本地 ahead 2（`3ea5f27` P0 体积守卫 / 崩溃路径瘦身、`765a742` 崩溃链守卫 / 时间戳线程安全）。
+      推 gitee `origin` 与 `github` 两端后回读引用核对（命令见 `HANDOFF.md` §7）。
+- [ ] **P1 第一步：`onTrimMemory`**。现在只认 `TRIM_MEMORY_COMPLETE`，墨水屏上更常来的是 `RUNNING_CRITICAL`；
+      注释写了「只在前台记」但代码没判 `tracker.foreground`——两者一起改，附一条 Robolectric 守卫（发一次记一条、同小时第二次不记）。
+- [ ] **M2 起头：`AnrWatchdog`**（8 秒无 pong → kind=`anr`，带主线程栈）。
+- [ ] 手上没有阻塞项：P0 与崩溃链都已收口，上面三条是「增强」，不是「修复」。
+
 ## 已完成（M1，2026-11-09）
 
 - [x] 建仓：README / AGENTS / NOTES / design / LICENSE；gitee + GitHub 双远端并推送

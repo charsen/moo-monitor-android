@@ -5,7 +5,7 @@
 ## 已完成（M1，2026-11-09）
 
 - [x] 建仓：README / AGENTS / NOTES / design / LICENSE；gitee + GitHub 双远端并推送
-- [x] Gradle wrapper + `monitor/` library module，`./gradlew :monitor:testDebugUnitTest` 通过（现 39 条）
+- [x] Gradle wrapper + `monitor/` library module，`./gradlew :monitor:testDebugUnitTest` 通过（现 46 条）
 - [x] `MonitorConfig` + `MooMonitor.install` 门面，缺 token 时整体禁用
 - [x] 默认未捕获异常链式接管（`runCatching` 包裹、交还原 handler）
 - [x] `crash.jsonl` / `queue.jsonl` 双文件双锁、轮转、坏行跳过、`dropped`
@@ -26,16 +26,24 @@
 - [x] 15 条新单测（含 Robolectric 快照守卫），共 39 条；四组变异分别转红 5 / 4 / 1 / 1 条，还原后全绿。
 - [x] BOOX 冷启动闭环复验：`crash.jsonl` 2800B、字段齐全 → `intake ok: 1 条` → 队列清空。
 
+## 已完成（2026-11-09 第二轮：崩溃链守卫 + 时间戳线程安全）
+
+- [x] `CrashHandlerTest`（5 条）：记录落盘、原 handler 必被调用、采集抛异常不影响原链路、空 token 不接管、同指纹每小时上限。
+      为此把链式接管抽成 `chainedCrashHandler(previous, onCrash)`，并加了仅测试用的 `MooMonitor.resetForTests()`。
+- [x] 时间戳线程安全：`AppEvent` / `Breadcrumbs` 的共享 `SimpleDateFormat` 换成 `IsoTime`（ThreadLocal）。
+      原实现里 `Breadcrumbs.add` 还在锁外格式化，并发会写出错乱日期或抛异常，再被 `runCatching` 吞成「少一条记录」。
+- [x] 五组变异转红 1 / 2 / 1 / 1 / 1 条，还原后 46 条全绿；**并发用例因复现不出竞态而删除**（不 bite 的守卫不留）。
+
 ## P0 — 影响「崩溃能否送达」
 
-- [ ] 补 `CrashHandlerTest`：断言装 handler 后抛异常时队列有一条 `crash` 且原 handler 被调用。
-      已有 `CrashSnapshotTest` 只覆盖记录组装，不覆盖 handler 链。
+（暂无）
 
 ## P1 — 体验与一致性
 
 - [ ] `onRenderProcessGone` 改成先保存阅读进度再重建、或只重建 WebView（现在 `recreate()` 整页重绘 500–800ms）。
-- [ ] `onTrimMemory` 补 `TRIM_MEMORY_RUNNING_CRITICAL`（比 `COMPLETE` 更常触发）。
-- [ ] 对齐 `docs/design.md` 与实现：模块文件名、本地合并（设计写了、实现决定不做）、401 是否清队列（见 `HANDOFF.md` §4、§8）。批次字节上限本轮已对齐。
+- [ ] `onTrimMemory` 补 `TRIM_MEMORY_RUNNING_CRITICAL`（比 `COMPLETE` 更常触发）；注释写了「前台」但代码没判 `tracker.foreground`。
+- [ ] 对齐 `docs/design.md` 与实现：本地合并（设计写了、实现决定不做）、401 是否清队列、`onTrimMemory` 的「只在前台」表述（见 `HANDOFF.md` §4、§8）。
+      模块文件清单与测试清单已对齐；批次字节上限、栈截断已对齐。
 
 ## 真机待验（人工）
 

@@ -165,6 +165,21 @@ object MooMonitor {
 
     // ---- 内部 ----
 
+    /**
+     * 单测专用：清空进程级状态，模拟「新进程」。
+     *
+     * [install] 是进程内只装一次的幂等入口，而单测共用同一个 JVM（Robolectric 还会跨类复用
+     * sandbox 的类加载器），不清就无法在一个测试类里覆盖多种安装场景。生产代码不要调用。
+     */
+    internal fun resetForTests() {
+        config = null
+        store = null
+        tracker = null
+        uploader = null
+        appContext = null
+        disabled = false
+    }
+
     private fun installCrashHandler(
         context: Context,
         config: MonitorConfig,
@@ -172,12 +187,11 @@ object MooMonitor {
         store: MonitorStore,
         snapshot: DeviceInfo.Snapshot?,
     ) {
-        val previous = Thread.getDefaultUncaughtExceptionHandler()
-        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
-            // 采集自身异常绝不能影响原链路，也不能让进程变成静默退出。
-            runCatching { recordCrash(context, config, tracker, store, thread, error, snapshot) }
-            previous?.uncaughtException(thread, error)
-        }
+        Thread.setDefaultUncaughtExceptionHandler(
+            chainedCrashHandler(Thread.getDefaultUncaughtExceptionHandler()) { thread, error ->
+                recordCrash(context, config, tracker, store, thread, error, snapshot)
+            }
+        )
     }
 
     private fun recordCrash(
@@ -255,6 +269,21 @@ object MooMonitor {
 
     private fun isDebug(context: Context): Boolean =
         (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+}
+
+/**
+ * 链式接管：先采集，再把异常原样交还 [previous]。
+ *
+ * 抽成独立函数是为了让这条契约能被直接钉住——它是「加监控不能改变宿主行为」的落点：
+ * - 采集自身抛异常必须被吞掉，否则宿主从「崩溃」变成「静默退出」，用户什么都看不到；
+ * - 交还这一步必须无条件执行，否则系统不再弹崩溃框、也不走它自己的收尾。
+ */
+internal fun chainedCrashHandler(
+    previous: Thread.UncaughtExceptionHandler?,
+    onCrash: (Thread, Throwable) -> Unit,
+): Thread.UncaughtExceptionHandler = Thread.UncaughtExceptionHandler { thread, error ->
+    runCatching { onCrash(thread, error) }
+    previous?.uncaughtException(thread, error)
 }
 
 /** 上报任务。成功 / 无数据 / 已禁用都算完成；可重试的失败交给 WorkManager 退避。 */

@@ -2,9 +2,6 @@ package com.mooeen.monitor
 
 import org.json.JSONArray
 import org.json.JSONObject
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /**
  * 报错前的操作链路（最近 30 条）。只在内存里，随崩溃记录一起落盘；
@@ -17,13 +14,10 @@ internal object Breadcrumbs {
     private const val CAP = 30
     private val lock = Any()
     private val items = ArrayDeque<JSONObject>(CAP)
-    private val iso = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
-        timeZone = java.util.TimeZone.getTimeZone("UTC")
-    }
 
     fun add(type: String, name: String, extra: Map<String, Any?> = emptyMap()) {
         val item = JSONObject()
-            .put("t", iso.format(Date()))
+            .put("t", IsoTime.now())
             .put("type", type)
             .put("name", Redactor.scrub(name) ?: "")
         extra.forEach { (k, v) -> if (v != null) item.put(k, v) }

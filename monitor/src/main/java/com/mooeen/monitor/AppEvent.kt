@@ -3,17 +3,10 @@ package com.mooeen.monitor
 import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import java.util.UUID
 
 /** 一条上报记录的组装。字段与云端契约（moo-scaffold-cloud/docs/app-monitor.md §4.2）一一对应。 */
 internal object AppEvent {
-
-    private val iso = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
-        timeZone = java.util.TimeZone.getTimeZone("UTC")
-    }
 
     /** 未捕获异常 / 主动上报共用。 */
     fun build(
@@ -35,7 +28,7 @@ internal object AppEvent {
             .put("platform", "android")
             .put("kind", kind)
             .put("count", 1)
-            .put("occurred_at", iso.format(Date()))
+            .put("occurred_at", IsoTime.now())
             .put("release", config.release)
             .put("build", config.build)
             .put("env", config.env)

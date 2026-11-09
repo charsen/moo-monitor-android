@@ -1,15 +1,17 @@
 # HANDOFF — moo-monitor-android
 
-> 交接快照：2026-11-09 17:45（GMT+8），`main` 最新提交为「P0 截断与崩溃路径瘦身」；hash 用 `git log -1` 读，不写死。
+> 交接快照：2026-11-09 18:05（GMT+8）。`main` 上是「P0 截断与崩溃路径瘦身」（`3ea5f27`）；
+> 之后这一轮（崩溃链守卫 + 时间戳线程安全）在工作区，尚未提交。hash 用 `git log -1` 读，不写死。
 > 面向「没参与过这段开发、现在要接着改这个库」的人。先读这一份，再读 `docs/design.md`。
 > 本文写**已经发生的事实**和**下一步怎么做**；计划进 `TODOS.md`，设计意图进 `docs/design.md`，真机结论进 `NOTES.md`。
 
 ## 1. 一句话现状
 
-Android 端崩溃采集 SDK 的 M1 已完整落地：能编译、24 条单测全过、已在 BOOX 真机上跑通
+Android 端崩溃采集 SDK 的 M1 已完整落地：能编译、46 条单测全过、已在 BOOX 真机上跑通
 「崩溃 → 落盘 → 下次启动合并 → 批量上报 → 生产返回 2xx → 队列清空」的闭环。
 云端 `moo-scaffold-cloud` 已部署上线，宿主 `shuhe` 已接入。**没有阻塞上线的已知问题**。
-体积截断、批次字节封顶与崩溃路径瘦身（P0 两项）已落地并在 BOOX 复验，剩下的是补强测试与 M2 能力，见 §8。
+体积截断、批次字节封顶与崩溃路径瘦身（P0 两项）已落地并在 BOOX 复验；崩溃接管链的测试补上了，
+顺手修掉一处跨线程共用 `SimpleDateFormat` 的隐患。剩下的是 P1 一致性项与 M2 能力，见 §8。
 
 ## 2. 状态快照
 
@@ -19,8 +21,8 @@ Android 端崩溃采集 SDK 的 M1 已完整落地：能编译、24 条单测全
 | 分支 | 只有 `main`（新仓未分线）；`origin` = gitee，`github` = GitHub，两边同步 |
 | HEAD | 本轮 P0 收口提交；上一版 `5a0b056` 是后台补发 / 主动上报节流 / 禁用状态持久化 |
 | 公开 | MIT（[`LICENSE`](LICENSE)），gitee + GitHub 双远端，推两端 |
-| 代码 | `monitor/` 单个 library module，12 个主源文件 + 8 个测试类，共 1522 行 |
-| 测试 | `./gradlew :monitor:testDebugUnitTest` → **39 条全过**（8 个测试类，`CrashSnapshotTest` 用 Robolectric） |
+| 代码 | `monitor/` 单个 library module，13 个主源文件 + 10 个测试类，共 1744 行 |
+| 测试 | `./gradlew :monitor:testDebugUnitTest` → **46 条全过**（10 个测试类，`CrashSnapshotTest` / `CrashHandlerTest` 用 Robolectric） |
 | 坐标 | `com.mooeen.monitor:monitor:0.1.0`（`group`/`version` 在 `monitor/build.gradle.kts`） |
 | 云端 | 已部署 `https://c.mooeen.com`，`app_errors` 表已建，路由已上线 |
 | 宿主 | `shuhe` 已接线（`1775931` 所在分支含 `7fa7049` 接入提交） |
@@ -35,7 +37,7 @@ cd /Volumes/dev/wwwroot/moo-monitor-android
 export JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
 
 # local.properties 已在机器上（sdk.dir=$HOME/Library/Android/sdk），被 .gitignore 忽略
-./gradlew :monitor:testDebugUnitTest          # 24 条
+./gradlew :monitor:testDebugUnitTest          # 46 条
 ./gradlew :monitor:compileDebugKotlin         # 只编译
 ```
 
@@ -66,8 +68,9 @@ token 来源只有两处：`/Volumes/dev/build_tokens` 的 §「书禾-安卓 ap
 | `SessionTracker.kt` | `ActivityLifecycleCallbacks`：session_id、前台状态、`onBackground` 回调 |
 | `PayloadLimits.kt` | UTF-8 字节截断、按字节切批（纯函数，崩溃路径零分配） |
 | `DeviceInfo.kt` | 设备上下文；`Snapshot` 是启动时冻结的静态部分，崩溃路径只读它 |
+| `IsoTime.kt` | ISO-8601 UTC 时间戳（ThreadLocal formatter：`SimpleDateFormat` 非线程安全，而调用方跨线程） |
 | `Breadcrumbs.kt` / `Redactor.kt` / `Throttle.kt` | 环形面包屑、脱敏、纯函数节流计数 |
-| `src/test/…` | `AppEventFramesTest`(4) `AppEventLimitsTest`(3) `CrashSnapshotTest`(2) `MonitorStoreTest`(5) `PayloadLimitsTest`(8) `RedactorTest`(4) `ThrottleTest`(6) `UploaderTest`(7) |
+| `src/test/…` | `AppEventFramesTest`(4) `AppEventLimitsTest`(3) `CrashHandlerTest`(5) `CrashSnapshotTest`(2) `IsoTimeTest`(2) `MonitorStoreTest`(5) `PayloadLimitsTest`(8) `RedactorTest`(4) `ThrottleTest`(6) `UploaderTest`(7) |
 
 对外只暴露 `MooMonitor` + `MonitorConfig`；其余一律 `internal`。
 
@@ -75,7 +78,7 @@ token 来源只有两处：`/Volumes/dev/build_tokens` 的 §「书禾-安卓 ap
 
 ```
 未捕获异常
-  → Thread.setDefaultUncaughtExceptionHandler（链式，runCatching 包住）
+  → chainedCrashHandler：runCatching 包住采集，然后把异常原样交还 previous
   → 崩溃风暴闸（同指纹 10 条/小时，SharedPreferences 计数）
   → AppEvent.build（exception() 脱敏+按字节截断；device/context 只读冻结的 Snapshot）
   → MonitorStore.appendCrash → filesDir/monitor/crash.jsonl（独立锁）
@@ -108,6 +111,7 @@ token 来源只有两处：`/Volumes/dev/build_tokens` 的 §「书禾-安卓 ap
 | 截断按 UTF-8 **字节**而不是字符数 | 中文 3 字节、emoji 4 字节；按字符截仍会超契约上限，按 char 截还会切坏代理对 |
 | 体积在组装时定、批次再按字节切 | 云端 422 是「整批不入库」，等上传时才量，一条坏记录会拖掉同批 50 条 |
 | 崩溃路径只读启动快照 | `StatFs` 是磁盘 IO、`ConnectivityManager` 是 Binder，进程随时被杀；session / screen / foreground / heap_used 仍当次读 |
+| 时间戳走 `IsoTime`（ThreadLocal），不放共享 `SimpleDateFormat` | 崩溃线程 / 业务线程 / 主线程都会写时间戳；共享 formatter 的中间态在实例字段里，并发会写出错乱日期或抛异常，再被 `runCatching` 吞成「少一条记录」 |
 
 ## 7. 跨仓依赖与唯一契约来源
 
@@ -139,16 +143,26 @@ git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $(printf 'x-ac
    `Uploader` 按 50 条 / 512KB 先到者切批，第一条再大也单独发，不会卡死队列。`AppEvent.exception()` 保证 `frames` 与 `stack` 是同一份文本。
 2. **崩溃路径瘦身**：`install()` 冻结 `DeviceInfo.Snapshot`（device / network / storage_free / heap_max），崩溃闭包只读它；
    session / screen / foreground / heap_used 仍当次读。BOOX 落盘记录 2800 字节，`device` 七项与 `context` 八项与改前一致。
-3. **守卫**：新增 15 条单测（含 1 个 Robolectric 类），共 39 条。四组变异分别转红 5 / 4 / 1 / 1 条
+3. **守卫**：新增 15 条单测（含 1 个 Robolectric 类），当时共 39 条。四组变异分别转红 5 / 4 / 1 / 1 条
    （不截断 / 不按字节切批 / build 忽略快照 / context 不读缓存），还原后全绿。BOOX 冷启动闭环见 §9。
+
+### 本轮已完成（2026-11-09，第二轮：崩溃链守卫 + 时间戳线程安全）
+
+1. **补 `CrashHandlerTest`（5 条）**：把链式接管从 `install()` 里抽成 `chainedCrashHandler(previous, onCrash)`，
+   钉住三条契约——记录落盘、原 handler 必被调用、采集自身抛异常不得影响原链路；另验「空 token 不接管」与「同指纹每小时上限」。
+   `install()` 是进程内幂等入口，为此加了 `internal fun resetForTests()`（仅测试用）。
+2. **时间戳线程安全**：`AppEvent` 与 `Breadcrumbs` 原各持一个共享 `SimpleDateFormat`，且 `Breadcrumbs.add` 在锁外格式化——
+   崩溃线程与业务线程会同时 `format`，出错又被 `runCatching` 吞掉，表现为「记录莫名少一条」。统一改用 `IsoTime`（ThreadLocal）。
+3. **守卫**：新增 7 条单测，共 46 条。五组变异分别转红 1 / 2 / 1 / 1 / 1 条
+   （去掉 runCatching / 不交还原 handler / 去掉风暴闸 / 空 token 也接管 / 单例持有共享 formatter）。
+   **并发用例按纪律删掉了**：8 线程 × 3000 轮 `CyclicBarrier` 对齐仍复现不出错乱日期，不 bite 的守卫不留（见 `IsoTimeTest` 注释）。
 
 ### P1 — 体验与一致性（待办）
 
-3. **`onRenderProcessGone` 用 `recreate()` 太重**：墨水屏整页重绘 500–800ms，且阅读位置没落盘会被弹回章节开头。
+1. **`onRenderProcessGone` 用 `recreate()` 太重**：墨水屏整页重绘 500–800ms，且阅读位置没落盘会被弹回章节开头。
    改为先保存进度再重建，或只重建 WebView（`design.md` §4.2 写的是「返回 false 交回宿主」，实际宿主返回 `true` + `recreate()`）。
-4. **补 `CrashHandlerTest`**：`design.md` §11 列了这个测试，实现里没有。断言「装 handler 后抛异常 → 队列有一条 crash 且原 handler 被调用」。
-5. `onTrimMemory` 只认 `TRIM_MEMORY_COMPLETE`，`RUNNING_CRITICAL` 更常触发。
-6. 对齐 `docs/design.md` 与实现：模块文件名、**本地合并**、401 是否清队列（批次字节上限本轮已对齐）。
+2. `onTrimMemory` 只认 `TRIM_MEMORY_COMPLETE`，`RUNNING_CRITICAL` 更常触发；注释里写了「前台」但代码没判 `tracker.foreground`。
+3. 对齐 `docs/design.md` 与实现：模块文件名、**本地合并**、401 是否清队列（批次字节上限已对齐）。
 
 ### M2 / M3
 
@@ -167,7 +181,7 @@ git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $(printf 'x-ac
 
 **已验证（有直接证据，不是推断）**：
 
-- 单测 **39 条**、`compileDebugKotlin` 干净；四组变异均有 bite，不是空绿灯。
+- 单测 **46 条**、`compileDebugKotlin` 干净；前后九组变异均有 bite，不是空绿灯。
 - 生产 HTTP 冒烟：写入 `saved:1`、原样重发 `duplicate`、新 `event_id` 累计、iOS token 写入、无权限 token 403。
 - 本地 cloud（MySQL + `php artisan serve`）真实闭环：后台列表/详情渲染 200、通知规则可写入。
 - BOOX NoteX5Mini 真机（设备 `4db66efd`）：
@@ -183,12 +197,16 @@ git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $(printf 'x-ac
   `device` 七键含 `model=NoteX5Mini`、`context` 含 `network=wifi` / `storage_free` / `heap_max` / `heap_used` / `session_id` / `install_id` / `screen` / `foreground`；
   `stack` 735B、`message` 19B（正常崩溃远不到截断阈值）。冷启动后 `17:40:47 D MooMonitor: intake ok: 1 条` +
   `WM-WorkerWrapper: Worker result SUCCESS` + `files/monitor` 清空。**记录形状与改前一致**，即快照与截断未改变上报内容。
+- **本轮第二轮复验（17:52–17:53，重装本轮包）**：`crash.jsonl` 2800 字节，
+  `occurred_at=2026-11-09T09:52:22.970Z`、`breadcrumbs` 3 条 `t` 全部合 ISO 契约（`IsoTime` 换掉共享 formatter 后现场验证）；
+  冷启动 `17:53:34 D MooMonitor: intake ok: 1 条` + `Worker result SUCCESS` + `files/monitor` 清空。
+  坑：**崩溃后先 `logcat -c` 再冷启动会把 `intake ok` 冲掉**（WorkManager 常在崩溃后 1–2 秒自动拉起并已发完）。
 
 **没法自动验 / 仍需人工**：
 
 - 后台「数据 → 客户端异常」列表里能否看到 `CrashedByAdbException`（SDK 侧无读接口、无登录态）。
 - 断网恢复、渲染进程被系统真杀（`adb` 触发不了）、国产 ROM 后台限制下的补发成功率。
-- 加了 handler 之后系统崩溃对话框是否仍正常弹出（代码上已交还原 handler）。
+- 加了 handler 之后系统崩溃对话框是否仍正常弹出（代码上已交还原 handler；`CrashHandlerTest` 断言了「原 handler 必被调用」这一必要条件，但不是充分条件）。
 - 崩溃时同步写盘在低端机上的耗时与 ANR 风险。
 
 ## 10. 环境坑（踩过的，别再踩）

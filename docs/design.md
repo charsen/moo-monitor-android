@@ -26,26 +26,30 @@
 
 单个 Gradle library module `monitor/`，包名 `com.mooeen.monitor`，与宿主包名无关。
 
+初稿是一个职责一个文件；实现时为了少几层跳转合并了（2026-11-09 对齐为下表，`HANDOFF.md` §4 同步）：
+
 ```
 monitor/
   build.gradle.kts
   src/main/java/com/mooeen/monitor/
-    MooMonitor.kt        门面：install / capture / breadcrumb / screen / flush
-    MonitorConfig.kt     端点、token、采样、上限；缺 token 时整体禁用
-    CrashHandler.kt      默认未捕获异常 + WebView 渲染进程
-    AnrWatchdog.kt       主线程卡死（M2）
-    Event.kt             记录模型 + toJson（手写 JSON，不引序列化库）
-    EventQueue.kt        JSONL 追加写、轮转、上限、丢弃计数
-    Uploader.kt          HttpURLConnection，批量、退避、状态码语义
-    FlushWorker.kt       WorkManager 唯一任务
+    MooMonitor.kt        门面（install / capture / screen / flush）+ 崩溃接管链 + FlushWorker
+    MonitorConfig.kt     端点、token、上限；缺 token 时整体禁用
+    AppEvent.kt          记录组装 + exception() 脱敏截断 + frames() 栈解析（手写 JSON）
+    MonitorStore.kt      queue.jsonl / crash.jsonl 双文件双锁、轮转、丢弃计数
+    Uploader.kt          批量与状态码语义（批次数、退避在 Worker 侧）
+    Transport.kt         接口 + HttpURLConnection 实现（可注入假实现做单测）
+    PayloadLimits.kt     UTF-8 字节截断、按字节切批
+    DeviceInfo.kt        Build / 屏幕 / 堆 / 存储 / 网络；Snapshot 供崩溃路径只读
+    IsoTime.kt           ISO-8601 UTC 时间戳（ThreadLocal formatter）
     Breadcrumbs.kt       内存环形缓冲（30 条）
     Redactor.kt          路径 / URL / 键名脱敏
-    DeviceInfo.kt        Build、屏幕、堆、存储、网络
     SessionTracker.kt    进程级 session_id + 前台状态
-  src/test/java/com/mooeen/monitor/   纯 JVM 单测
+    Throttle.kt          纯函数计数（崩溃小时闸 / 主动上报天闸）
+  src/test/java/com/mooeen/monitor/   纯 JVM 单测 + 2 个 Robolectric 类
 ```
 
-`MooMonitor` 之外的类型默认 `internal`，对外只暴露门面 + `MonitorConfig` + `Event`（只读）。宿主不应依赖内部结构。
+`AnrWatchdog.kt`（M2）尚未存在。`MooMonitor` 之外的类型默认 `internal`，对外只暴露门面 + `MonitorConfig`。
+宿主不应依赖内部结构。
 
 ## 4. 采集点
 
@@ -187,15 +191,18 @@ includeBuild("../moo-monitor-android")
 
 | 层 | 内容 |
 |---|---|
-| 单元 | `EventTest`：JSON 形状、截断、`Redactor` 规则 |
-| 单元 | `EventQueueTest`：追加、轮转、`dropped` 计数、半行容错 |
-| 单元 | `UploaderTest`：`Transport` 接口注入假实现，覆盖 200/401/422/500/超时 |
-| 定向 | `CrashHandlerTest`：装 handler 后抛异常，断言队列里有一条 `crash` 且原 handler 被调用 |
+| 单元 | `AppEventFramesTest` / `AppEventLimitsTest`：帧解析、脱敏、截断后 `frames` 与 `stack` 同源 |
+| 单元 | `MonitorStoreTest`：追加、轮转、`dropped` 计数、半行容错 |
+| 单元 | `UploaderTest`：`Transport` 注入假实现，覆盖 200/401/422/500/超时 + 条数与字节切批 |
+| 单元 | `PayloadLimitsTest`：UTF-8 字节截断（不切坏代理对）、按字节切批 |
+| 定向 | `CrashHandlerTest`（Robolectric）：装 handler 后抛异常 → 队列有一条 `crash` 且原 handler 被调用；
+采集自身抛异常不影响原链；空 token 不接管；同指纹每小时上限 |
 | 真机 | 宿主里制造崩溃，确认后台 30 秒内出现；断网 3 次启动后恢复上报 |
 
 单测证明不了「进程被杀之前写进去了」，真机必跑。
 
-实际测试类与条数见 `HANDOFF.md` §2 / §4（39 条，含 `PayloadLimitsTest`、`AppEventLimitsTest`、`CrashSnapshotTest`）。
+实际测试类与条数见 `HANDOFF.md` §2 / §4（46 条，含 `PayloadLimitsTest`、`AppEventLimitsTest`、`CrashSnapshotTest`、
+`CrashHandlerTest`、`IsoTimeTest`）。
 
 ## 12. 分阶段
 

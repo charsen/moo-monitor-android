@@ -6,9 +6,11 @@ Android 端异常采集 SDK：崩溃、渲染进程死亡、低内存、主线�
 
 ## 状态
 
-**M1 已实现：39 条单测通过，已在 BOOX 真机跑通「崩溃 → 落盘 → 上报 → 云端 2xx」闭环，宿主 `shuhe` 已接入。**
+**M1 已实现：46 条单测通过，已在 BOOX 真机跑通「崩溃 → 落盘 → 上报 → 云端 2xx」闭环，宿主 `shuhe` 已接入。**
 **P0 体积守卫已落地**：`exception` 按 UTF-8 字节截断（message 8KB / stack 32KB）、批次按 50 条与 512KB 先到者切批；
 崩溃路径只读启动时冻结的设备快照，不在崩溃线程上做磁盘 IO / Binder 调用。本轮同一台 BOOX 复验闭环通过。
+崩溃接管链有独立守卫（记录落盘 / 原 handler 必被调用 / 采集抛异常不影响原链路 / 空 token 不接管 / 风暴闸），
+时间戳走 ThreadLocal formatter——`SimpleDateFormat` 非线程安全，而写时间戳的线程天然不止一个。
 接手与排障先读 [`HANDOFF.md`](HANDOFF.md)；设计与边界见 [`docs/design.md`](docs/design.md)，实施顺序见 [`TODOS.md`](TODOS.md)。
 
 > `docs/design.md` 是设计稿，仍有差异的条目（本地合并、401 是否清队列、模块文件名）见 `HANDOFF.md` §4、§8；

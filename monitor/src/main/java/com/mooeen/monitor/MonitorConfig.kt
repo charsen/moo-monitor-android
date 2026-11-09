@@ -1,0 +1,29 @@
+package com.mooeen.monitor
+
+/**
+ * SDK 配置。token 为空即整体禁用——不在没有凭据的情况下悄悄发请求。
+ *
+ * @param endpoint 云端地址，末尾不要带斜杠
+ * @param token 项目 token（能力必须含 app_errors），构建时注入，不进源码
+ * @param app 产品 slug（如 shuhe），与云端项目对应
+ * @param release 版本名（Android versionName）
+ * @param build 版本号（versionCode）
+ * @param env release / debug，云端按此做环境过滤
+ */
+data class MonitorConfig(
+    val endpoint: String = "https://c.mooeen.com",
+    val token: String = "",
+    val app: String = "",
+    val release: String = "",
+    val build: String = "",
+    val env: String = "release",
+    /** 队列上限：条数与字节，先到者为准。 */
+    val maxQueueRecords: Int = 200,
+    val maxQueueBytes: Int = 2 * 1024 * 1024,
+    /** 崩溃风暴闸：同一指纹每小时最多写多少条。 */
+    val crashThrottlePerHour: Int = 10,
+    /** 崩溃文件最多留多少条（下次启动并入队列）。 */
+    val maxCrashRecords: Int = 50,
+) {
+    val enabled: Boolean get() = token.isNotBlank() && endpoint.isNotBlank()
+}

@@ -6,7 +6,7 @@ Android 端异常采集 SDK：崩溃、渲染进程死亡、低内存、主线�
 
 ## 状态
 
-**设计完成，代码未开工。** 设计与边界见 [`docs/design.md`](docs/design.md)，实施顺序见 [`TODOS.md`](TODOS.md)。
+**M1 已实现（库 + 单测 18 条通过），真机闭环待验。** 设计与边界见 [`docs/design.md`](docs/design.md)，实施顺序见 [`TODOS.md`](TODOS.md)。
 
 ## 定位
 

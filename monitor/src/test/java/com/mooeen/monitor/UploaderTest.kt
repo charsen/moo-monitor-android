@@ -84,4 +84,32 @@ class UploaderTest {
         assertEquals(Uploader.Outcome.Nothing, uploader(store, transport).flush())
         assertTrue(transport.bodies.isEmpty())
     }
+
+    @Test
+    fun `large records are split by byte budget and the rest stays queued`() {
+        val store = MonitorStore(tmp.newFolder(), config())
+        repeat(4) { i ->
+            store.append(JSONObject().put("event_id", "e$i").put("blob", "x".repeat(200_000)))
+        }
+        val transport = FakeTransport(Transport.Result.Ok)
+
+        val outcome = uploader(store, transport).flush(maxBatches = 1)
+
+        assertEquals(Uploader.Outcome.Sent(2), outcome)
+        assertEquals(2, JSONObject(transport.bodies[0]).getJSONArray("records").length())
+        assertEquals("未发出的记录要留到下一轮", 2, store.pending(10).size)
+    }
+
+    @Test
+    fun `an oversized first record cannot wedge the queue`() {
+        val store = MonitorStore(tmp.newFolder(), config())
+        store.append(JSONObject().put("event_id", "big").put("blob", "x".repeat(700_000)))
+        store.append(record("next"))
+        val transport = FakeTransport(Transport.Result.Ok)
+
+        val outcome = uploader(store, transport).flush(maxBatches = 1)
+
+        assertEquals(Uploader.Outcome.Sent(1), outcome)
+        assertEquals("next", store.pending(10).single().getString("event_id"))
+    }
 }

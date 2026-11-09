@@ -53,6 +53,8 @@ object MooMonitor {
         runCatching {
             val tracker = SessionTracker(application)
             val store = MonitorStore.forApp(application, config)
+            // 崩溃线程只带这份冻结快照，不再做磁盘 IO / Binder；取不到就让它退回实时读取。
+            val frozen = runCatching { DeviceInfo.snapshot(application) }.getOrNull()
 
             this.config = config
             this.appContext = application.applicationContext
@@ -66,7 +68,7 @@ object MooMonitor {
             application.registerActivityLifecycleCallbacks(tracker)
             // 退到后台立刻补发一次：只在启动后等 10 秒的话，用户开一眼就退的崩溃要等下次启动。
             tracker.onBackground = { schedule(application, delaySeconds = 0) }
-            installCrashHandler(application, config, tracker, store)
+            installCrashHandler(application, config, tracker, store, frozen)
 
             schedule(application, delaySeconds = 10)
             Breadcrumbs.add("lifecycle", "app_start")
@@ -168,11 +170,12 @@ object MooMonitor {
         config: MonitorConfig,
         tracker: SessionTracker,
         store: MonitorStore,
+        snapshot: DeviceInfo.Snapshot?,
     ) {
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, error ->
             // 采集自身异常绝不能影响原链路，也不能让进程变成静默退出。
-            runCatching { recordCrash(context, config, tracker, store, thread, error) }
+            runCatching { recordCrash(context, config, tracker, store, thread, error, snapshot) }
             previous?.uncaughtException(thread, error)
         }
     }
@@ -184,6 +187,7 @@ object MooMonitor {
         store: MonitorStore,
         thread: Thread,
         error: Throwable,
+        snapshot: DeviceInfo.Snapshot?,
     ) {
         val stack = Log.getStackTraceString(error)
         if (throttled(context, config, error, stack)) return
@@ -199,6 +203,7 @@ object MooMonitor {
             threadName = thread.name,
             extras = mapOf("uptime_ms" to android.os.SystemClock.elapsedRealtime()),
             dropped = store.dropped,
+            snapshot = snapshot,
         )
         store.appendCrash(record)
     }

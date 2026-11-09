@@ -91,6 +91,10 @@ SDK 不重建 WebView，那是宿主的界面职责。这条对以 WebView 渲�
 
 ## 5. 记录构造
 
+> 2026-11-09 已落地：`AppEvent.exception()` 在脱敏后按 UTF-8 字节截断（预算含结尾标记、不切坏代理对），
+> `frames` 与 `stack` 用同一份文本；`device` / `context` 的静态部分由 `DeviceInfo.Snapshot` 在 `install()` 冻结，
+> 崩溃线程不再查 `StatFs` 与 `ConnectivityManager`。
+
 一条 `crash` 在进程内组装（约 2ms）：
 
 - `exception.name` = `error.javaClass.name`；`message` 截 8KB；`stack` = `Log.getStackTraceString(error)` 截 32KB。
@@ -123,7 +127,7 @@ SDK 不重建 WebView，那是宿主的界面职责。这条对以 WebView 渲�
 
 - `FlushWorker`：`OneTimeWorkRequest`，`NetworkType.CONNECTED`，唯一任务名 `moo-monitor-flush`，`ExistingWorkPolicy.KEEP`。
 - 触发：启动后 10 秒、`onStop`（退后台）、手动 `flush()`。
-- 批次 ≤50 条 / ≤512KB，先到先发。
+- 批次 ≤50 条 / ≤512KB，先到先发（2026-11-09 已落地：`PayloadLimits.batch` 按累计字节切，第一条再大也单独发，避免卡死队列）。
 - 发送前按指纹分组：同 hash 合并 `count`，只发一条——减少体积，也让服务端增量语义更准。
 - 状态码：`2xx` 删批；`401/403` 清队列并持久化 `disabled`，之后 `install()` 直接返回；`422` 丢批；`429` 读 `Retry-After`；`5xx`/网络错误指数退避（30s、2m、8m、30m），最多 6 次。
 - `HttpURLConnection` 而非 OkHttp：为 200 行上报引一个网络库不划算。连接/读取超时各 10 秒。
@@ -190,6 +194,8 @@ includeBuild("../moo-monitor-android")
 | 真机 | 宿主里制造崩溃，确认后台 30 秒内出现；断网 3 次启动后恢复上报 |
 
 单测证明不了「进程被杀之前写进去了」，真机必跑。
+
+实际测试类与条数见 `HANDOFF.md` §2 / §4（39 条，含 `PayloadLimitsTest`、`AppEventLimitsTest`、`CrashSnapshotTest`）。
 
 ## 12. 分阶段
 

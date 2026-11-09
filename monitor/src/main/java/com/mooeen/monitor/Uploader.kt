@@ -24,8 +24,11 @@ internal class Uploader(
 
         var total = 0
         repeat(maxBatches) {
-            val records = store.pending(BATCH_RECORDS)
-            if (records.isEmpty()) return if (total > 0) Outcome.Sent(total) else Outcome.Nothing
+            val pending = store.pending(BATCH_RECORDS)
+            if (pending.isEmpty()) return if (total > 0) Outcome.Sent(total) else Outcome.Nothing
+
+            // 条数与字节先到者为准：一条超长栈不该把同批的其它记录一起拖进 422。
+            val records = PayloadLimits.batch(pending, BATCH_RECORDS, PayloadLimits.BATCH_BYTES)
 
             val body = JSONObject()
                 .put("app", config.app)

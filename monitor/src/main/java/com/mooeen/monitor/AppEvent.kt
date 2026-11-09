@@ -27,6 +27,8 @@ internal object AppEvent {
         threadName: String?,
         extras: Map<String, Any?> = emptyMap(),
         dropped: Int = 0,
+        /** 崩溃路径传启动时冻结的设备快照，避免崩溃线程再做磁盘 IO / Binder 调用。 */
+        snapshot: DeviceInfo.Snapshot? = null,
     ): JSONObject {
         val record = JSONObject()
             .put("event_id", UUID.randomUUID().toString())
@@ -38,16 +40,13 @@ internal object AppEvent {
             .put("build", config.build)
             .put("env", config.env)
 
-        record.put("exception", JSONObject().apply {
-            put("name", Redactor.scrub(name) ?: "Error")
-            put("message", Redactor.scrub(message ?: ""))
-            put("stack", Redactor.scrub(stack ?: ""))
-            threadName?.let { put("thread", it) }
-        })
+        val (exception, safeStack) = exception(name, message, stack, threadName)
+        record.put("exception", exception)
 
-        record.put("frames", frames(stack, context.packageName))
-        record.put("device", DeviceInfo.device(context))
-        record.put("context", DeviceInfo.context(context, tracker))
+        // frames 必须与 exception.stack 是同一份文本：分开截断会让帧对不上栈。
+        record.put("frames", frames(safeStack, context.packageName))
+        record.put("device", snapshot?.device ?: DeviceInfo.device(context))
+        record.put("context", DeviceInfo.context(context, tracker, snapshot))
         record.put("breadcrumbs", Breadcrumbs.snapshot())
 
         val payload = JSONObject()
@@ -56,6 +55,28 @@ internal object AppEvent {
         if (payload.length() > 0) record.put("payload", payload)
 
         return record
+    }
+
+    /**
+     * 脱敏 + 截断，返回 exception 对象与截断后的栈文本。
+     *
+     * 抽出来是为了让这条「体积上限」规则能在纯 JVM 单测里直接验，不必构造 Context；
+     * 崩溃和主动上报都走 build，所以这一处就是唯一的入口。
+     */
+    fun exception(
+        name: String,
+        message: String?,
+        stack: String?,
+        threadName: String?,
+    ): Pair<JSONObject, String> {
+        val safeStack = PayloadLimits.truncate(Redactor.scrub(stack) ?: "", PayloadLimits.STACK_BYTES)
+        val safeMessage = PayloadLimits.truncate(Redactor.scrub(message) ?: "", PayloadLimits.MESSAGE_BYTES)
+        val out = JSONObject()
+            .put("name", Redactor.scrub(name) ?: "Error")
+            .put("message", safeMessage)
+            .put("stack", safeStack)
+        threadName?.let { out.put("thread", it) }
+        return out to safeStack
     }
 
     /**

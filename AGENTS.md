@@ -5,7 +5,7 @@
 ## 项目职责
 
 - Android 端异常采集 SDK：崩溃、渲染进程死亡、低内存、主线程卡死，落盘后批量上报到 Moo Scaffold Cloud。
-- 与 `moo-monitor-laravel` / `moo-go-monitor` / `moo-monitor-vue` 同属一套体系，共用 cloud 的 intake 契约；**不在本仓另写一份契约**，上报格式以 `moo-scaffold-cloud/docs/app-monitor.md` 为准。
+- 与 `moo-monitor-laravel` / `moo-monitor-go` / `moo-monitor-vue` 同属一套体系，共用 cloud 的 intake 契约；**不在本仓另写一份契约**，上报格式以 `moo-scaffold-cloud/docs/app-monitor.md` 为准。
 - 独立库，不导入宿主业务代码；宿主只通过 `MooMonitor` 门面与 `MonitorConfig` 交互。
 
 ## 采集红线

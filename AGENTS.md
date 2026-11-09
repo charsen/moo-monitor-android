@@ -1,4 +1,4 @@
-# Moo Android Monitor 协作与编码要求
+# moo-monitor-android 协作与编码要求
 
 > 规则来源：通用协作、授权、Git 与测试规则见 `~/.agents/AGENTS.md`（每轮自动加载）。本文件只写本仓特有约束，不复制全局规则；冲突时以本文件为准。
 

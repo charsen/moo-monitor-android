@@ -1,4 +1,4 @@
-# 设计：Moo Android Monitor
+# 设计：moo-monitor-android
 
 > 上报契约以 `moo-scaffold-cloud/docs/app-monitor.md` 为准（数据表、指纹、count 语义、端点与能力）。本文只写 SDK 侧的采集、落盘、上报与边界。
 
@@ -166,7 +166,7 @@ buildConfigField("String", "MOO_MONITOR_TOKEN",
 M1 阶段用 **composite build**，宿主 `settings.gradle.kts` 里：
 
 ```kotlin
-includeBuild("../moo-android-monitor")
+includeBuild("../moo-monitor-android")
 ```
 
 不改宿主的依赖发布流程，也不要求先发 maven。等第二个宿主出现再谈发布（`mavenLocal` 或私有仓库）。

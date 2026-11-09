@@ -1,4 +1,4 @@
-# Moo Android Monitor
+# moo-monitor-android
 
 Android 端异常采集 SDK：崩溃、渲染进程死亡、低内存、主线程卡死，落盘后批量上报到 [Moo Scaffold Cloud](https://c.mooeen.com)。
 
@@ -50,6 +50,6 @@ token 为空时 SDK 整体禁用，不发任何请求。
 
 ## 仓库与许可
 
-双远端：gitee `charsen/moo-android-monitor`（主）、GitHub `charsen/moo-android-monitor`（镜像）。
+双远端：gitee `charsen/moo-monitor-android`（主）、GitHub `charsen/moo-monitor-android`（镜像）。
 
 MIT，见 [`LICENSE`](LICENSE)。

@@ -3,7 +3,7 @@
 ## 建仓
 
 - [x] 目录、README、AGENTS、NOTES、设计文档（2026-11-09）
-- [ ] 建远端仓库（gitee `charsen/moo-android-monitor`，与其它 monitor 仓一致）并推送首个提交
+- [ ] 建远端仓库（gitee `charsen/moo-monitor-android`，与其它 monitor 仓一致）并推送首个提交
 - [ ] 生成 Gradle wrapper 与 `monitor/` module 骨架，能 `./gradlew :monitor:test` 通过空测试
 
 ## M1（未开工）

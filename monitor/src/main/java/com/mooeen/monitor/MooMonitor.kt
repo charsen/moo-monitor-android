@@ -23,6 +23,10 @@ object MooMonitor {
 
     private const val TAG = "MooMonitor"
     private const val WORK_NAME = "moo-monitor-flush"
+    private const val PREFS = "moo-monitor"
+    private const val KEY_DISABLED = "disabled"
+    /** 主动上报每类每天上限；崩溃走 [MonitorConfig.crashThrottlePerHour]，不共用。 */
+    private const val HANDLED_DAILY_CAP = 20
 
     @Volatile private var config: MonitorConfig? = null
     @Volatile private var store: MonitorStore? = null
@@ -40,6 +44,11 @@ object MooMonitor {
             return
         }
         if (this.config != null) return
+        if (isDisabled(application)) {
+            // 服务端曾明确拒绝（401/403）：不要每次启动都再撞一次。
+            if (isDebug(application)) Log.w(TAG, "token 曾被服务端拒绝，监控保持禁用")
+            return
+        }
 
         runCatching {
             val tracker = SessionTracker(application)
@@ -55,6 +64,8 @@ object MooMonitor {
             store.mergeCrashIntoQueue()
 
             application.registerActivityLifecycleCallbacks(tracker)
+            // 退到后台立刻补发一次：只在启动后等 10 秒的话，用户开一眼就退的崩溃要等下次启动。
+            tracker.onBackground = { schedule(application, delaySeconds = 0) }
             installCrashHandler(application, config, tracker, store)
 
             schedule(application, delaySeconds = 10)
@@ -67,6 +78,7 @@ object MooMonitor {
         val cfg = config ?: return
         val ctx = appContext ?: return
         if (!installed) return
+        if (captureThrottled(ctx, "handled|${error.javaClass.name}|${error.message}")) return
         runCatching {
             val t = tracker ?: return
             val record = AppEvent.build(
@@ -91,6 +103,7 @@ object MooMonitor {
         val cfg = config ?: return
         val ctx = appContext ?: return
         if (!installed) return
+        if (captureThrottled(ctx, "$kind|${extras["message"] ?: ""}")) return
         runCatching {
             val t = tracker ?: return
             val record = AppEvent.build(
@@ -142,6 +155,8 @@ object MooMonitor {
         val outcome = u.flush()
         if (outcome is Uploader.Outcome.Disabled) {
             disabled = true
+            appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                ?.edit()?.putBoolean(KEY_DISABLED, true)?.apply()
         }
         return outcome
     }
@@ -195,20 +210,31 @@ object MooMonitor {
     private fun throttled(context: Context, config: MonitorConfig, error: Throwable, stack: String): Boolean {
         val firstFrame = stack.lineSequence().firstOrNull { it.trimStart().startsWith("at ") }?.trim() ?: ""
         val key = "throttle." + Integer.toHexString((error.javaClass.name + firstFrame).hashCode())
-        val prefs = context.getSharedPreferences("moo-monitor", Context.MODE_PRIVATE)
-        val hour = System.currentTimeMillis() / 3_600_000
-        val raw = prefs.getString(key, null)?.split(':')
-        val storedHour = raw?.getOrNull(0)?.toLongOrNull()
-        val count = raw?.getOrNull(1)?.toIntOrNull() ?: 0
-
-        return if (storedHour == hour && count >= config.crashThrottlePerHour) {
-            true
-        } else {
-            val next = if (storedHour == hour) count + 1 else 1
-            prefs.edit().putString(key, "$hour:$next").apply()
-            false
-        }
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val bucket = (System.currentTimeMillis() / 3_600_000L).toInt()
+        val raw = prefs.getString(key, null)
+        if (Throttle.shouldSkip(raw, bucket, config.crashThrottlePerHour)) return true
+        prefs.edit().putString(key, Throttle.next(raw, bucket)).apply()
+        return false
     }
+
+    /**
+     * 主动上报的按天闸：同一类错误（kind + 名称 + 消息）每天最多 [HANDLED_DAILY_CAP] 条。
+     * 没有这个闸，业务在 catch 里循环报错会把 200 条队列灌满，把真正的崩溃挤出去。
+     */
+    private fun captureThrottled(context: Context, key: String): Boolean {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val storageKey = "cap." + Integer.toHexString(key.hashCode())
+        val bucket = (System.currentTimeMillis() / 86_400_000L).toInt()
+        val raw = prefs.getString(storageKey, null)
+        if (Throttle.shouldSkip(raw, bucket, HANDLED_DAILY_CAP)) return true
+        prefs.edit().putString(storageKey, Throttle.next(raw, bucket)).apply()
+        return false
+    }
+
+    /** 服务端明确拒绝过（401/403）：持久化，避免每次启动都再撞一次。 */
+    private fun isDisabled(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_DISABLED, false)
 
     private fun schedule(context: Context, delaySeconds: Long) {
         runCatching {

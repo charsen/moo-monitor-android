@@ -19,6 +19,11 @@ internal class SessionTracker(context: Context) : Application.ActivityLifecycleC
 
     val sessionId: String = UUID.randomUUID().toString()
 
+    /** 应用退到后台（最后一个 Activity 停止）时回调。宿主与 SDK 用来立刻补发队列。 */
+    var onBackground: (() -> Unit)? = null
+
+    private var startedActivities = 0
+
     @Volatile
     var screen: String? = null
         private set
@@ -47,9 +52,21 @@ internal class SessionTracker(context: Context) : Application.ActivityLifecycleC
 
     override fun onActivityPaused(activity: Activity) = Unit
 
-    override fun onActivityStarted(activity: Activity) = Unit
+    override fun onActivityStarted(activity: Activity) {
+        startedActivities++
+        foreground = true
+    }
 
-    override fun onActivityStopped(activity: Activity) = Unit
+    override fun onActivityStopped(activity: Activity) {
+        // 旋转 / 换主题会走 stop→start，不算真的退到后台。
+        if (activity.isChangingConfigurations) return
+        startedActivities--
+        if (startedActivities <= 0) {
+            startedActivities = 0
+            foreground = false
+            onBackground?.invoke()
+        }
+    }
 
     override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
 

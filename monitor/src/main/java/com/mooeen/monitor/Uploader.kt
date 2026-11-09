@@ -37,15 +37,24 @@ internal class Uploader(
 
             when (val result = transport.post("${config.endpoint}/api/v1/app-errors/intake", config.token, body.toString())) {
                 is Transport.Result.Ok -> {
+                    // 成功也留一行：现场排「到底发出去没有」时，只有失败日志是不够的。
+                    android.util.Log.d(TAG, "intake ok: ${records.size} 条")
                     store.dropFirst(records.size)
                     total += records.size
                 }
-                is Transport.Result.Unauthorized -> return Outcome.Disabled
+                is Transport.Result.Unauthorized -> {
+                    android.util.Log.w(TAG, "intake 被拒(${result.code})：token 无效或撤权，停止发送")
+                    return Outcome.Disabled
+                }
                 is Transport.Result.Rejected -> {
                     // 格式问题重试也不会成功：丢掉这一批，避免卡住后面的记录。
+                    android.util.Log.w(TAG, "intake 格式错误，丢弃 ${records.size} 条")
                     store.dropFirst(records.size)
                 }
-                is Transport.Result.Retryable -> return Outcome.Retry(result.reason)
+                is Transport.Result.Retryable -> {
+                    android.util.Log.w(TAG, "intake 稍后重试：${result.reason}")
+                    return Outcome.Retry(result.reason)
+                }
             }
         }
 
@@ -53,6 +62,7 @@ internal class Uploader(
     }
 
     private companion object {
+        const val TAG = "MooMonitor"
         const val BATCH_RECORDS = 50
     }
 }

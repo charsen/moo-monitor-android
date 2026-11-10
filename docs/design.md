@@ -111,6 +111,7 @@ SDK 不重建 WebView，那是宿主的界面职责。这条对以 WebView 渲�
 - `context`：`session_id`、`screen`（`ActivityLifecycleCallbacks` 记录的当前 Activity 类名）、`foreground`、`network`（`ConnectivityManager` 只读 `activeNetworkInfo.type`）、`heap_used/max`、`storage_free`（`StatFs(filesDir)`）。
 - `exception.thread` 为脱敏线程名；`payload.uptime_ms` 是从本次 SDK 安装开始的单调时钟间隔，不是设备开机时长。`dropped` 是当前进程观察到的容量/坏行/写入失败丢弃计数，不是永久累计值。
 - `payload` 递归脱敏敏感键/字符串，有深度、共享总节点/字符串预算和 8KB 最终字节预算；未知对象不调用 `toString()`。业务调用点仍不得传入书名、正文、账号等字段。
+- 文本扫描最多65,536个UTF-16单元；超限只保留预算内完整行，截口所在整行省略，无完整行则用占位符。预算内先识别完整凭据，再按字段字节数截断；extras键名也清洗。引号值支持转义引号，JVM使用占有式量词避免长值导致递归回溯栈溢出。
 - 崩溃记录中的 `network` / `storage_free` 来自启动快照，并非崩溃瞬间测量；`heap_used` / 前后台 / 界面为采集时读取。快照失败时缺字段，不在崩溃线程回退系统查询。
 
 **不进记录**：用户内容、文件路径中的书名/文件名、账号凭据、任何业务数据。`screen` 只放类名，不放书名这类业务字段。

@@ -6,6 +6,33 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RedactorTest {
+    @Test
+    fun `shared cross SDK synthetic corpus stays safe and readable`() {
+        val text = javaClass.getResourceAsStream("/cross-sdk-redaction.json")!!.bufferedReader().use { it.readText() }
+        val cases = org.json.JSONObject(text).getJSONArray("cases")
+        for (i in 0 until cases.length()) {
+            val row = cases.getJSONObject(i)
+            val out = Redactor.scrub(row.getString("input"))!!
+            val forbidden = row.getJSONArray("forbidden")
+            for (j in 0 until forbidden.length()) assertFalse(row.getString("name"), out.contains(forbidden.getString(j)))
+            assertTrue(row.getString("name"), out.contains(row.getString("keep")))
+        }
+    }
+
+    @Test
+    fun `payload keys are scrubbed before truncation`() {
+        val value = Redactor.value(mapOf("note token=tiny-key-secret" to "value"))
+        assertFalse(value.toString().contains("tiny-key-secret"))
+    }
+
+    @Test
+    fun `escaped quoted secrets and oversized input fail closed`() {
+        val out = Redactor.scrub("""password="first \"second\" final-secret" keep=visible""")!!
+        assertFalse(out.contains("final-secret"))
+        assertTrue(out.contains("keep=visible"))
+        assertEquals("[truncated]", Redactor.scrub("x".repeat(65_537)))
+        assertFalse(Redactor.scrub("password=\"${"a".repeat(40_000)} final-secret\" keep=visible")!!.contains("final-secret"))
+    }
 
     @Test
     fun `query secrets are masked`() {

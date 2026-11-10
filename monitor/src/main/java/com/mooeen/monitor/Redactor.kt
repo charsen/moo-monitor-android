@@ -11,13 +11,21 @@ internal object Redactor {
     private val PATH = Regex("""(?:/data/|/storage/|/sdcard/|/mnt/)[^\r\n:\"'<>]+""")
     private val BEARER = Regex("""\bBearer\s+[A-Za-z0-9._~+/=-]+""", RegexOption.IGNORE_CASE)
     private val JWT = Regex("""\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b""")
-    private val SECRET = Regex("""(?i)(?<![A-Za-z0-9])(password|passwd|pwd|token|access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|private[_-]?key|secret|api[_-]?key|authorization|cookie)\b([\"']?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&]+)""")
+    // 占有式量词避免 JVM 对长引号值递归回溯，崩溃线程上不能因脱敏再栈溢出。
+    private val SECRET = Regex("""(?i)(?<![A-Za-z0-9])(password|passwd|pwd|token|access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|private[_-]?key|secret|api[_-]?key|authorization|cookie)\b([\"']?\s*[:=]\s*)("(?:[^"\\\r\n]++|\\.)*+(?:"|$)|'(?:[^'\\\r\n]++|\\.)*+(?:'|$)|[^\s,;&]+)""")
     private val SECRET_KEY = Regex("""(?i)(password|passwd|pwd|secret|token|authorization|cookie|api.?key|credential)""")
     private val SECRET_QUERY = Regex("""([?&](?:password|pwd|token|secret|api_key|apikey|authorization|sig|signature)=)[^&\s]+""", RegexOption.IGNORE_CASE)
 
     fun scrub(value: String?): String? {
         if (value.isNullOrEmpty()) return value
         var out = value
+        if (value.length > 65_536) {
+            // 保留完整栈行，截口所在的整行省略，避免留下被切开的凭据。
+            val prefix = value.substring(0, 65_536)
+            val boundary = prefix.lastIndexOf('\n')
+            if (boundary < 0) return "[truncated]"
+            out = prefix.substring(0, boundary) + "\n[truncated]"
+        }
         out = SECRET_QUERY.replace(out) { it.groupValues[1] + "***" }
         out = BEARER.replace(out, "Bearer ***")
         out = JWT.replace(out, "[jwt]")
@@ -53,9 +61,12 @@ internal object Redactor {
                         break
                     }
                     if (key !is String) continue
-                    val safeKey = PayloadLimits.truncate(key, minOf(128, budget.bytes))
+                    val safeKey = PayloadLimits.truncate(scrub(key).orEmpty(), minOf(128, budget.bytes))
                     budget.bytes -= PayloadLimits.size(safeKey)
-                    val safeValue = if (SECRET_KEY.containsMatchIn(key)) {
+                    val safeValue = if (key.length > 65_536) {
+                        budget.nodes--
+                        "[truncated]"
+                    } else if (SECRET_KEY.containsMatchIn(key)) {
                         budget.nodes--
                         "***"
                     } else sanitize(value, depth + 1, budget)

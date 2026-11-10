@@ -1,20 +1,16 @@
 # moo-monitor-android
 
-Android 端异常采集 SDK：崩溃、渲染进程死亡、低内存、主线程卡死，落盘后批量上报到 [Moo Scaffold Cloud](https://c.mooeen.com)。
+Android 端异常采集 SDK：崩溃、渲染进程死亡与低内存信号，落盘后批量上报到 [Moo Scaffold Cloud](https://c.mooeen.com)。
 
 与 `moo-monitor-laravel`（PHP）、`moo-monitor-go`（Go）、`moo-monitor-vue`（浏览器）、`moo-monitor-ios`（iOS）同属一套监控体系，共用 cloud 的 intake 契约，不重复造云端。
 
 ## 状态
 
-**M1 已实现：46 条单测通过，已在 BOOX 真机跑通「崩溃 → 落盘 → 上报 → 云端 2xx」闭环，宿主 `shuhe` 已接入。**
-**P0 体积守卫已落地**：`exception` 按 UTF-8 字节截断（message 8KB / stack 32KB）、批次按 50 条与 512KB 先到者切批；
-崩溃路径只读启动时冻结的设备快照，不在崩溃线程上做磁盘 IO / Binder 调用。本轮同一台 BOOX 复验闭环通过。
-崩溃接管链有独立守卫（记录落盘 / 原 handler 必被调用 / 采集抛异常不影响原链路 / 空 token 不接管 / 风暴闸），
-时间戳走 ThreadLocal formatter——`SimpleDateFormat` 非线程安全，而写时间戳的线程天然不止一个。
-接手与排障先读 [`HANDOFF.md`](HANDOFF.md)；设计与边界见 [`docs/design.md`](docs/design.md)，实施顺序见 [`TODOS.md`](TODOS.md)。
+M1 已接入书禾 Android。崩溃、WebView 渲染进程死亡与旧系统低内存信号已实现；ANR watchdog 尚未实现。
 
-> `docs/design.md` 是设计稿，仍有差异的条目（本地合并、401 是否清队列、模块文件名）见 `HANDOFF.md` §4、§8；
-> 栈截断与批次字节上限本轮已按设计落地。
+可靠性实现包括双日志、原子合并/重写、发送收据确认、逐条回执、队列条数/字节预算、脱敏和退避。
+崩溃仍交还系统处理链；同步写盘和极端 OOM 的实机边界见 [`docs/design.md`](docs/design.md)。
+本轮审核与定向验证见 [`HANDOFF.md`](HANDOFF.md)，后续任务见 [`TODOS.md`](TODOS.md)。
 
 ## 定位
 
@@ -45,6 +41,7 @@ class ShuheApp : Application() {
             release = BuildConfig.VERSION_NAME,
             build = BuildConfig.VERSION_CODE.toString(),
             env = if (BuildConfig.DEBUG) "debug" else "release",
+            inAppPackage = "com.mooeen.shuhe", // 源码 namespace，不含 debug applicationId 后缀
         ))
     }
 
@@ -59,7 +56,7 @@ class ShuheApp : Application() {
 ./gradlew assembleDebug -PmooMonitorToken=<token>
 ```
 
-token 为空时 SDK 整体禁用，不发任何请求。宿主还需要一枚只勾 `app_errors` 能力的云端 token。
+token 为空时 SDK 整体禁用，不发任何请求。宿主需要只具备客户端公开能力的云端 token；安装身份和队列不得参与系统备份，配置见设计 §13。
 
 ## 文档
 
@@ -72,6 +69,16 @@ token 为空时 SDK 整体禁用，不发任何请求。宿主还需要一枚只
 | [`TODOS.md`](TODOS.md) | 分阶段实施清单 |
 
 云端契约（数据表、指纹规则、count 语义、端点与能力）以 `moo-scaffold-cloud/docs/app-monitor.md` 为唯一来源，本仓不复制。
+
+
+## 隔离设备测试
+
+显式构建测试夹具：`./gradlew -PmonitorDeviceQa :device-qa:assembleDebug`，再执行
+`python3 tools/device-qa/run.py --serial <设备序列号>`。默认构建不会加载该模块。
+
+脚本仅操作 `com.mooeen.monitor.deviceqa` 和本机临时 SQLite，使用固定的本地 fixture token，不读取生产 token。
+它会安装/清理该测试包数据，设置并最终移除设备端 tcp:18764 的 adb reverse；请勿把该端口用于其他任务。
+需要同级 moo-scaffold-cloud、PHP、JDK17、Android SDK 与已授权设备。结果保存在 ignored 的 `build/monitor-deviceqa-*/`。
 
 ## 首个接入方
 

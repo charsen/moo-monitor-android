@@ -24,6 +24,16 @@ data class MonitorConfig(
     val crashThrottlePerHour: Int = 10,
     /** 崩溃文件最多留多少条（下次启动并入队列）。 */
     val maxCrashRecords: Int = 50,
+    /** 源码 namespace；与 applicationId 不同时显式填写（如 debug/隔离包后缀）。 */
+    val inAppPackage: String = "",
 ) {
+    init {
+        require(maxQueueRecords > 0 && maxQueueBytes > 0 && maxCrashRecords > 0 && crashThrottlePerHour > 0)
+    }
     val enabled: Boolean get() = token.isNotBlank() && endpoint.isNotBlank()
 }
+
+/** 仅保存发送身份的摘要，不把 token 放进偏好文件或日志。 */
+internal fun MonitorConfig.deliveryScope(): String = java.security.MessageDigest.getInstance("SHA-256")
+    .digest("${endpoint.trimEnd('/')}|$app|$token".toByteArray(Charsets.UTF_8))
+    .joinToString("") { "%02x".format(it) }

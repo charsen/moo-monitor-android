@@ -76,4 +76,34 @@ class CrashSnapshotTest {
         assertTrue(record.getJSONObject("device").has("os"))
         assertTrue(record.getJSONObject("context").has("network"))
     }
+
+    @Test
+    fun `payload redacts nested secrets and bounds unsupported extras`() {
+        val app = RuntimeEnvironment.getApplication()
+        fun event(extras: Map<String, Any?>) = AppEvent.build(
+            app, MonitorConfig(token = "t"), SessionTracker(app), "handled", "Error", null, null, "main", extras,
+        )
+        val payload = event(mapOf("accessToken" to "private", "nested" to mapOf("password" to "private"), "nan" to Double.NaN)).getJSONObject("payload")
+        assertFalse(payload.toString().contains("private"))
+        assertFalse(payload.has("nan"))
+        val large = event((1..30).associate { "key$it" to "一 ".repeat(2000) }).getJSONObject("payload")
+        assertTrue(PayloadLimits.size(large.toString()) <= 8 * 1024)
+        assertTrue(large.has("__truncated"))
+    }
+
+    @Test
+    fun `source namespace identifies app frames when the application id has a suffix`() {
+        val app = RuntimeEnvironment.getApplication()
+        val context = object : android.content.ContextWrapper(app) {
+            override fun getPackageName() = "com.example.monitorqa"
+        }
+        val record = AppEvent.build(
+            context, MonitorConfig(token = "t", inAppPackage = "com.example"), SessionTracker(context),
+            "handled", "Error", null,
+            "    at com.example.Reader.open(Reader.kt:1)\n    at com.exampleother.Engine.open(Engine.kt:2)", "main",
+        )
+        val frames = record.getJSONArray("frames")
+        assertTrue(frames.getJSONObject(0).getBoolean("app"))
+        assertFalse(frames.getJSONObject(1).getBoolean("app"))
+    }
 }

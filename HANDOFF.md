@@ -1,5 +1,84 @@
 # HANDOFF — moo-monitor-android
 
+## 当前复核（2026-11-10）
+
+用户随后授权“合并分支”：本轮成果提交后，将同一任务分支分别合入本地 dev 与 main，完整合入后清理任务分支；不推送、不打 tag、不部署。下方“未提交/合并”均为验证时快照，实际交付状态以 Git 引用为准。
+
+第二轮按用户“测试，复核”及连接 BOOX 的指令完成了设备场景；当前定向结果 **SDK 71 / cloud 33 / 书禾 4**，以及 BOOX **9 个独立 SDK 场景 + 1 个真实书禾阅读页场景**。不是全站 E2E，也没有生产部署。
+
+### 第二轮发现与修复
+
+1. 独立 JWT 被保留类名的新边界漏过：新增专门 JWT 清理规则。对应失败用例已先转红后修复。
+2. extras 只有“每容器上限/深度”仍会按扇出指数展开共享 Map：改为共享节点/字符串预算；用访问计数提前断言，避免测试本身爆内存。对应失败用例已转红后修复。
+3. cloud 的大 payload 回退重新放回未脱敏 context：先清理独立 context，再进入正常/回退分支。对应失败用例先转红后修复。
+4. 畸形帧/面包屑及历史截断标记会毒化详情/AI 读取：复用 StructuredList 的 AppErrorRecords cast，覆盖 frames/src_frames/breadcrumbs 的读写类型边界；入站失败用例及原始脏 JSON 的列表/详情/AI 回归通过。
+5. applicationId 后缀不同于源码 namespace：新增可选 `MonitorConfig.inAppPackage`，缺省兼容原 applicationId；书禾显式填 `com.mooeen.shuhe`。受影响源码、宿主、测试和文档已核对。未改 wire schema。
+6. **公开 token 越权关单**：带 status=resolved 的上报能关闭已有异常，违反 app_errors 只写观察的约定；失败用例已复现。客户端处置输入现被忽略，上报统一为 open 观察，原有处理中/回归守卫照常执行；后台授权 resolve 的回归仍通过。此修复尚未部署到生产。
+
+### BOOX 设备证据（Android13 / NoteX5Mini / 4db66efd）
+
+- 独立 APK 使用本机 fixture token 与 Laravel 的独立 SQLite；HTTP/队列/邮件外呼被隔离，没有生产请求。可重复入口：`./gradlew -PmonitorDeviceQa :device-qa:assembleDebug`，`python3 tools/device-qa/run.py --serial <serial>`。默认宿主构建不加载该模块。
+- 原始证据：`build/monitor-deviceqa-a5qtrap8/results.json`、`requests.jsonl`、`summary.json`、`crash-logcat.txt`、`renderer-recovered.png`。9 个场景均通过：普通采集入库与脱敏；180 条按 50/50/50/30 接续；部分回执只保留 1 条再发送；429 最早发送限制（实际间隔约 30.094 秒）；3 次重启保留同一 event_id；401 停采停发与换 token 恢复；真实 Java 崩溃交还系统并重启补发；真实 chrome://crash 后宿主存活；转发两次 CRITICAL 只记录一次。
+- “离线”场景为测试端点 503/暂不可达语义，不是关闭整机网络；memory 场景为主动转发等级 15，不是制造实际 OOM。不会据此宣称物理断网约束、真实内存压力或 ROM 长期休眠已验证。
+- 单次设备测量：首个主动采集约 **17.516ms**（另两次冷态约21ms）；崩溃从 throw 到 SDK 交还处理器约 **48.824ms**。不是 p95、不是 OOM 上界，没有与旧包的同条件性能对照。原生报文 UTC 与 SQLite 业务时间也回读对齐（11:58:55）。
+- 真实书禾隔离包另行使用实际 ReaderActivity/BookImporter：生成 TXT → 第4页 → renderer crash → Activity 重建。0-based page **3→3**、offset **1017→1017**、旧 WebView 已移除，约 **1706ms** 恢复，cloud 收到 did_crash=true 的 webview_gone。截图已查看，正文及底部 4/41 正常。证据在 `../shuhe/build/monitor-deviceqa/`。
+- SDK 设备 APK（含本轮脱敏/预算修复）的 SHA 为 `170502d202418c9fd29ad4eb79682e154f26341cc19cf02569e8b2a64976d550`，2,532,618字节，0.1.0/1，com.mooeen.monitor.deviceqa。namespace 配置随后由 JVM 与实际书禾的最新 composite 构建验证。
+- 书禾实际验收 APK SHA 为 `cb05d2da698ab6e5c23c5f1f5273c509e02db33a89d05949190503bf0a586b0b`，9,064,527字节，0.3.27/32，com.mooeen.shuhe.monitorqa。两包均为 min24/target34、无 native ABI 限定，v2 签名，证书 SHA `e80b629d18e808ff3f69b2b9f95bcb89e517c85439b1b37f8eee4582e111e087`，设备回拉 SHA 与产物一致。完整构建流水在 `../shuhe/docs/BUILD.md`。
+- 首轮设备脚本在 token_b 尚未执行时 force-stop 导致假超时，已用 nonce 完成回执修正，并完整复跑9场景；另一个初始 Gradle overlay 在 projectsEvaluated 改 manifest 太迟，改为 finalizeDsl 后 instrumentation 注册成功。两者均为夹具问题，没有算作 SDK 缺陷或通过结果。
+- 验收后已移除本轮两个临时包、tcp:18764 reverse、设备种子文件、本机监听；正式 com.mooeen.shuhe 与既有 .debug 保留。正式版仍0.3.27/32，firstInstallTime=2026-10-19 20:35:57，lastUpdateTime=2026-11-09 17:56:15。
+
+### 第二轮本地验证
+
+- 合并前按仓库要求执行 `./gradlew -I /tmp/moo-monitor-precommit.init.gradle :monitor:test`，临时 init 脚本仅选择下列9个受影响测试类；Debug/Release 各 **71项通过**，XML 均为0失败/错误。没有扩展到未受影响类、宿主全量或 E2E。
+- 同首轮9类定向 SDK 测试，增补总节点预算/JWT/并发追加/崩溃不等队列锁/namespace 后，**71项通过**；lintDebug 通过（无 Error，既有同步 commit/依赖建议 Warning 保留）。
+- 同首轮4个 PHP Feature 文件，增补 context 回退、诊断列表、历史脏形状及公开 token 处置边界后，**33项 / 202断言通过**。变更的 controller/model/cast/test 定向 Pint 通过，共享 IntakePipeline 的既有格式告警仍按首轮记录保留。
+- 书禾 ReaderDocumentCallbackTest **4项通过**；常规 composite 构建编译了最新 SDK 与 ShuheApp 配置。没有递增任何已有版本号，未提交/合并/推送。
+
+---
+
+### 首轮审核记录（同日，设备验收前的快照）
+
+三仓使用 `fix-monitor-reliability`，未提交、未合并、未推送，版本号保持原值。本轮按用户指令直接修复确认的问题；下方 2026-11-09 内容为历史快照，不代表当前缺陷/分支/测试状态。
+
+- SDK：修复字节上限、坏行/轮转确认错位、崩溃先删源、非原子重写；改用原始行收据。正常追加不再逐条重扫文件；UTF-8 计数不分配完整字节数组。新增半行恢复、逐条回执、续传与合并唤醒。
+- 采集：普通入口的偏好读写全部纳入失败隔离；旋转计数平衡；前台 CRITICAL/后台 COMPLETE 分开判断；撤权后停止采集与发送，禁用绑定发送身份摘要；uptime 改为安装起点。敏感 extras/线程名与绝对文件名在落盘前清理。
+- cloud：已用失败测试复现旧事件回滚时间/版本、现场字段丢失、畸形指纹整批 500。修复后按事件日期记日桶；现场白名单进入 payload.context，消息/栈入库前脱敏并落实预算、severity 推导。
+- 书禾：失效 WebView 先移出视图树、destroy、使旧 document 回调失效，再 recreate；备份配置排除监控偏好与日志。没有改变阅读同步协议或引入新业务上报点。
+- SDK 的初始缺陷复现：22 项定向测试中 5 项失败，覆盖字节上限、合并失败保留源、短凭据/文件名、轮转确认、坏行确认。cloud 最初新增 3 项用例在旧实现全部失败，末轮 UTC 跨日用例也先复现后修复。修复后的实际结果见下文验证记录。
+- 本轮没有出 APK、安装设备、访问生产或跑 E2E。书禾 Gradle 在配置阶段也要求 release 反馈 token；JVM 测试使用 `SHUHE_FEEDBACK_TOKEN=unit-test-only` 占位，未读取或注入真实 token，不代表反馈或监控鉴权已联调。
+- cloud / Android 共用的唯一契约已更新；Apple SDK 代码未改，仍使用旧的整批确认策略，其逐条回执适配在 cloud TODOS 中单列。
+
+本轮剩余边界：ANR/native/被杀采集仍未实现；Android 14+ 不再发送旧内存等级；队列 200 条/2MB 与服务端每指纹最近 50 个 event_id 去重均为有界保证；同步捕获仍有写盘/内存开销，没有实机性能百分比。见设计 §13 与 TODOS。
+
+### 本轮验证记录
+
+- SDK：`./gradlew :monitor:testDebugUnitTest`，通过 `--tests` 定向选择 `MonitorStoreTest`、`UploaderTest`、`HttpTransportTest`、`RedactorTest`、`AppEventLimitsTest`、`AppEventFramesTest`、`CrashHandlerTest`、`CrashSnapshotTest`、`PayloadLimitsTest`；9 类 **66 项通过**。读取 `monitor/build/test-results/testDebugUnitTest/TEST-*.xml` 核实 failures/errors 均为 0。未跑未受影响的 IsoTime/Throttle 测试。
+- SDK：`:monitor:lintDebug` 通过，报告无 Error，15 条 Warning（3 条 ApplySharedPref 来自刻意同步提交的崩溃限流/Worker 禁用与退避状态；其余为依赖/AGP 版本建议），未升任何依赖或版本号。
+- cloud：`vendor/bin/phpunit tests/Feature/AppErrorIntakeTest.php tests/Feature/AppErrorNotificationTest.php tests/Feature/AppErrorPagesTest.php tests/Feature/IntakePipelineTest.php`，**29 项 / 183 断言通过**，SQLite 内存库，队列/HTTP 外呼隔离。新增真实 SDK UTC 跨日用例先复现 8 小时偏差，再修复为上海时区入库。
+- cloud：AppErrorIntakeController/AppErrorIntakeTest 的定向 Pint 通过；共享 IntakePipeline `php -l` 通过。该共享文件已有 Pint 格式告警，把 HEAD 原文导出到临时文件复核亦失败（同为 unary_operator_spaces / braces_position / not_operator_with_successor_space / single_line_empty_body / phpdoc_align），未为了检查扩大格式 diff。
+- 书禾：`SHUHE_FEEDBACK_TOKEN=unit-test-only ./gradlew :app:testDebugUnitTest --tests com.mooeen.shuhe.ui.reader.ReaderDocumentCallbackTest`，**4 项通过**，通过 composite build 使用本轮 SDK。备份两份 XML 已解析并断言监控偏好/目录均被排除。
+- SDK 的 HTTP 传输用例只访问临时 127.0.0.1 ServerSocket，覆盖响应体、302 不跳转、429 Retry-After、408 保留、超大响应保留；没有访问生产。
+
+### 审核结论索引
+
+| 范围 | 确认的问题 | 修复方式 |
+|---|---|---|
+| P0 送达 | 崩溃先删源、重写先截断原文件 | 先提交目标、原子替换，失败保留源与原队列 |
+| P0 送达 | 坏行/上传期间轮转后按行数确认 | 发送时冻结原始行收据，确认时只移除匹配记录 |
+| P0 送达 | 见到 200 就删整批 | 完整逐条回执，仅确认终结项，保留 retryable |
+| P1 容量/调度 | 字节配置未使用、单轮 150 条后无接续、KEEP 可能吞运行中的唤醒 | 双预算、续传 Worker、合并尚未开始的唤醒并允许后继 |
+| P1 诊断 | UTC 写本地列差 8 小时、旧事件回滚版本/时间、现场字段丢失 | 业务时区归一，事件日桶和聚合时间分离，保留诊断白名单 |
+| P1 隔离 | 畸形指纹字段整批 500；普通采集的偏好访问可能抛回宿主 | 指纹输入防御和采集失败隔离 |
+| P1 隐私/准确性 | 短凭据、嵌套 extras、私有文件名未清理；长类名可能被误脱敏 | 结构化递归清理、有界 payload、保留源码标识符 |
+| P1 生命周期 | 旋转导致前台计数不平；撤权仍可采集、换 token 不恢复 | stop 平衡计数；发送身份范围内禁用 |
+| P1 宿主 | 死 WebView 仍可被生命周期/回调访问；备份恢复监控安装身份 | 及时移除/销毁和回调失效，排除备份 |
+| P2 开销 | 每次追加扫全文、计字节分配完整 byte[] | 维护计数、按码点计 UTF-8 长度 |
+
+
+---
+
+## 历史快照（2026-11-09）
+
 > 交接快照：2026-11-09 18:05（GMT+8）。`main` 上是「P0 截断与崩溃路径瘦身」（`3ea5f27`）；
 > 之后这一轮（崩溃链守卫 + 时间戳线程安全）在工作区，尚未提交。hash 用 `git log -1` 读，不写死。
 > 面向「没参与过这段开发、现在要接着改这个库」的人。先读这一份，再读 `docs/design.md`。

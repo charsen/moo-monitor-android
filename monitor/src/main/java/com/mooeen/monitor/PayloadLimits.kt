@@ -18,10 +18,20 @@ internal object PayloadLimits {
 
     /** 设计 §7 定的单批字节上限；条数上限仍由 Uploader 控制。 */
     const val BATCH_BYTES = 512 * 1024
+    const val RECORD_BYTES = 256 * 1024
 
     const val MARKER = "\n…[truncated]"
 
-    fun size(text: String): Int = text.toByteArray(Charsets.UTF_8).size
+    fun size(text: String): Int {
+        var bytes = 0
+        var index = 0
+        while (index < text.length) {
+            val cp = text.codePointAt(index)
+            bytes += utf8Bytes(cp)
+            index += Character.charCount(cp)
+        }
+        return bytes
+    }
 
     /**
      * 按 UTF-8 字节截断，预算含结尾的 [MARKER]。
@@ -31,9 +41,10 @@ internal object PayloadLimits {
      * 因为调用点在崩溃线程上。
      */
     fun truncate(value: String, maxBytes: Int): String {
+        if (maxBytes <= 0) return ""
         if (value.isEmpty() || size(value) <= maxBytes) return value
-        var budget = maxBytes - size(MARKER)
-        if (budget < 0) budget = 0
+        val marker = if (maxBytes >= size(MARKER)) MARKER else ""
+        val budget = maxBytes - size(marker)
 
         var used = 0
         var end = 0
@@ -44,7 +55,7 @@ internal object PayloadLimits {
             used += bytes
             end += Character.charCount(cp)
         }
-        return value.substring(0, end) + MARKER
+        return value.substring(0, end) + marker
     }
 
     /**
@@ -60,9 +71,12 @@ internal object PayloadLimits {
         for (record in records) {
             if (out.size >= maxRecords) break
             val bytes = size(record.toString()) + 1
+            // 兼容旧队列里的超大记录：它只能单独送走/拒收，不能拖掉同批的正常事件。
+            if (out.isNotEmpty() && bytes > RECORD_BYTES) break
             if (out.isNotEmpty() && used + bytes > maxBytes) break
             out.add(record)
             used += bytes
+            if (bytes > RECORD_BYTES) break
         }
         return out
     }
@@ -71,6 +85,7 @@ internal object PayloadLimits {
     private fun utf8Bytes(cp: Int): Int = when {
         cp < 0x80 -> 1
         cp < 0x800 -> 2
+        cp in 0xD800..0xDFFF -> 1 // Java UTF-8 encoder 对孤立代理使用 '?'。
         cp < 0x10000 -> 3
         else -> 4
     }

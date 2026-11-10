@@ -37,14 +37,17 @@ internal object AppEvent {
         record.put("exception", exception)
 
         // frames 必须与 exception.stack 是同一份文本：分开截断会让帧对不上栈。
-        record.put("frames", frames(safeStack, context.packageName))
+        record.put("frames", frames(safeStack, config.inAppPackage.ifBlank { context.packageName }))
         record.put("device", snapshot?.device ?: DeviceInfo.device(context))
         record.put("context", DeviceInfo.context(context, tracker, snapshot))
         record.put("breadcrumbs", Breadcrumbs.snapshot())
 
-        val payload = JSONObject()
-        extras.forEach { (k, v) -> if (v != null) payload.put(k, v) }
+        var payload = Redactor.value(extras) as JSONObject
         if (dropped > 0) payload.put("dropped", dropped)
+        if (PayloadLimits.size(payload.toString()) > 8 * 1024) {
+            payload = JSONObject().put("__truncated", "oversized")
+            if (dropped > 0) payload.put("dropped", dropped)
+        }
         if (payload.length() > 0) record.put("payload", payload)
 
         return record
@@ -68,7 +71,7 @@ internal object AppEvent {
             .put("name", Redactor.scrub(name) ?: "Error")
             .put("message", safeMessage)
             .put("stack", safeStack)
-        threadName?.let { out.put("thread", it) }
+        threadName?.let { out.put("thread", PayloadLimits.truncate(Redactor.scrub(it).orEmpty(), 255)) }
         return out to safeStack
     }
 
@@ -80,20 +83,21 @@ internal object AppEvent {
         val out = JSONArray()
         if (stack.isNullOrBlank()) return out
 
-        val pattern = Regex("""^\s*at\s+([^(]+)\(([^):]+)(?::(\d+))?\)""")
         for (line in stack.lineSequence()) {
             if (out.length() >= 60) break
-            val m = pattern.find(line) ?: continue
+            val m = FRAME.find(line) ?: continue
             val function = m.groupValues[1].trim()
             val file = m.groupValues[2].trim()
             val lineNo = m.groupValues[3].toIntOrNull()
             val frame = JSONObject()
                 .put("function", function)
                 .put("file", file)
-                .put("app", function.startsWith(packageName))
+                .put("app", function.startsWith("$packageName."))
             lineNo?.let { frame.put("line", it) }
             out.put(frame)
         }
         return out
     }
+
+    private val FRAME = Regex("""^\s*at\s+([^(]+)\(([^):]+)(?::(\d+))?\)""")
 }

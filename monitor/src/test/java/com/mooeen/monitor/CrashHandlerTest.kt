@@ -7,11 +7,13 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
+import org.robolectric.Robolectric
 import org.robolectric.annotation.Config
 import java.io.File
 import java.util.concurrent.atomic.AtomicInteger
@@ -124,10 +126,100 @@ class CrashHandlerTest {
         assertEquals("超过每小时上限的同一崩溃不该继续写盘", 2, crashRecords().size)
     }
 
+    @Test
+    fun `rotation keeps foreground count balanced and eventually reports background`() {
+        val tracker = SessionTracker(app)
+        var backgroundCalls = 0
+        tracker.onBackground = { backgroundCalls++ }
+        val old = object : android.app.Activity() {
+            override fun isChangingConfigurations() = true
+        }
+        tracker.onActivityStarted(old)
+        tracker.onActivityStopped(old)
+        assertTrue(tracker.foreground)
+        val replacement = Robolectric.buildActivity(android.app.Activity::class.java).create().get()
+        tracker.onActivityStarted(replacement)
+        tracker.onActivityStopped(replacement)
+        assertFalse(tracker.foreground)
+        assertEquals(1, backgroundCalls)
+    }
+
+    @Test
+    fun `low memory captures foreground critical once and ignores UI hidden`() {
+        Thread.setDefaultUncaughtExceptionHandler { _, _ -> }
+        MooMonitor.install(app, config())
+        val field = MooMonitor::class.java.getDeclaredField("tracker").apply { isAccessible = true }
+        (field.get(null) as SessionTracker).onForeground()
+        MooMonitor.onTrimMemory(android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN)
+        MooMonitor.onTrimMemory(android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL)
+        MooMonitor.onTrimMemory(android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL)
+        val records = File(app.filesDir, "monitor/queue.jsonl").readLines().filter { it.isNotBlank() }.map { JSONObject(it) }
+        assertEquals(1, records.size)
+        assertEquals("low_memory", records.single().getString("kind"))
+    }
+
+    @Test
+    fun `authorization rejection disables flushing and crashes until credentials change`() {
+        Thread.setDefaultUncaughtExceptionHandler { _, _ -> }
+        val cfg = config()
+        MooMonitor.install(app, cfg)
+        val store = MonitorStore.forApp(app, cfg)
+        store.append(JSONObject().put("event_id", "a"))
+        var calls = 0
+        val transport = object : Transport {
+            override fun post(url: String, token: String, body: String): Transport.Result {
+                calls++
+                return Transport.Result.Unauthorized(401)
+            }
+        }
+        val field = MooMonitor::class.java.getDeclaredField("uploader").apply { isAccessible = true }
+        field.set(null, Uploader(cfg, store, transport))
+        assertEquals(Uploader.Outcome.Disabled, MooMonitor.flushOnce())
+        assertEquals(Uploader.Outcome.Disabled, MooMonitor.flushOnce())
+        Thread.getDefaultUncaughtExceptionHandler()!!.uncaughtException(Thread("t"), RuntimeException("disabled"))
+        assertEquals(1, calls)
+        assertTrue(crashRecords().isEmpty())
+        MooMonitor.resetForTests()
+        MooMonitor.install(app, cfg)
+        assertFalse(MooMonitor.installed)
+        MooMonitor.install(app, cfg.copy(token = "replacement"))
+        assertTrue(MooMonitor.installed)
+    }
+
+    @Test
+    fun `active capture throttles cannot throw into the host`() {
+        Thread.setDefaultUncaughtExceptionHandler { _, _ -> }
+        MooMonitor.install(app, config())
+        val field = MooMonitor::class.java.getDeclaredField("appContext").apply { isAccessible = true }
+        val broken = object : android.content.ContextWrapper(app) {
+            override fun getSharedPreferences(name: String?, mode: Int): android.content.SharedPreferences = error("unavailable")
+        }
+        field.set(null, broken)
+        MooMonitor.capture(IllegalStateException("handled"))
+        MooMonitor.capture("webview_gone")
+        MooMonitor.onTrimMemory(android.content.ComponentCallbacks2.TRIM_MEMORY_COMPLETE)
+    }
+
+    @Test
+    fun `handled error budgets distinguish call sites without using dynamic messages`() {
+        Thread.setDefaultUncaughtExceptionHandler { _, _ -> }
+        MooMonitor.install(app, config())
+        fun capture(method: String, message: String) {
+            val error = IllegalStateException(message)
+            error.stackTrace = arrayOf(StackTraceElement("com.example.Reader", method, "Reader.kt", 1))
+            MooMonitor.capture(error)
+        }
+        repeat(25) { capture("load", "dynamic id $it") }
+        capture("render", "different failure")
+        val records = File(app.filesDir, "monitor/queue.jsonl").readLines().filter { it.isNotBlank() }
+        assertEquals(21, records.size)
+    }
+
     private fun config(
         token: String = "t",
         crashThrottlePerHour: Int = 10,
     ) = MonitorConfig(
+        endpoint = "http://127.0.0.1:9",
         token = token,
         app = "shuhe",
         release = "1.0.0",

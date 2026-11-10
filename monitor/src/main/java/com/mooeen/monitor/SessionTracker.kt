@@ -36,7 +36,7 @@ internal class SessionTracker(context: Context) : Application.ActivityLifecycleC
         val prefs = context.getSharedPreferences("moo-monitor", Context.MODE_PRIVATE)
         val existing = prefs.getString("install_id", null)
         val raw = existing ?: UUID.randomUUID().toString().also {
-            prefs.edit().putString("install_id", it).apply()
+            prefs.edit().putString("install_id", it).commit()
         }
         MessageDigest.getInstance("SHA-256").digest(raw.toByteArray())
             .joinToString("") { "%02x".format(it) }
@@ -45,9 +45,8 @@ internal class SessionTracker(context: Context) : Application.ActivityLifecycleC
     override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
 
     override fun onActivityResumed(activity: Activity) {
-        screen = activity.javaClass.simpleName
         foreground = true
-        Breadcrumbs.add("screen", screen ?: "")
+        runCatching { recordScreen(activity.javaClass.simpleName) }
     }
 
     override fun onActivityPaused(activity: Activity) = Unit
@@ -59,18 +58,28 @@ internal class SessionTracker(context: Context) : Application.ActivityLifecycleC
 
     override fun onActivityStopped(activity: Activity) {
         // 旋转 / 换主题会走 stop→start，不算真的退到后台。
+        startedActivities = (startedActivities - 1).coerceAtLeast(0)
         if (activity.isChangingConfigurations) return
-        startedActivities--
         if (startedActivities <= 0) {
             startedActivities = 0
             foreground = false
-            onBackground?.invoke()
+            runCatching { onBackground?.invoke() }
         }
     }
 
     override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
 
     override fun onActivityDestroyed(activity: Activity) = Unit
+
+    fun recordScreen(name: String) {
+        if (!SCREEN.matches(name)) return
+        screen = name
+        Breadcrumbs.add("screen", name)
+    }
+
+    private companion object {
+        val SCREEN = Regex("[A-Za-z_$][A-Za-z0-9_$.]{0,63}")
+    }
 
     fun onForeground() {
         foreground = true

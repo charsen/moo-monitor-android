@@ -15,12 +15,11 @@ internal object Breadcrumbs {
     private val lock = Any()
     private val items = ArrayDeque<JSONObject>(CAP)
 
-    fun add(type: String, name: String, extra: Map<String, Any?> = emptyMap()) {
+    fun add(type: String, name: String) = runCatching {
         val item = JSONObject()
             .put("t", IsoTime.now())
             .put("type", type)
-            .put("name", Redactor.scrub(name) ?: "")
-        extra.forEach { (k, v) -> if (v != null) item.put(k, v) }
+            .put("name", PayloadLimits.truncate(Redactor.scrub(name).orEmpty(), 128))
         synchronized(lock) {
             if (items.size >= CAP) items.removeFirst()
             items.addLast(item)

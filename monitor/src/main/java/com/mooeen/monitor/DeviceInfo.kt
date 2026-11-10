@@ -23,7 +23,7 @@ internal object DeviceInfo {
         val heapMax: Long,
     )
 
-    /** 只在 install() 调一次；调用点包 runCatching，失败就退回实时读取。 */
+    /** 只在 install() 调一次；失败时调用方使用缺字段快照，不在崩溃线程重查系统服务。 */
     fun snapshot(context: Context): Snapshot = Snapshot(
         device = device(context),
         network = network(context),

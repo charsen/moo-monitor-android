@@ -16,10 +16,10 @@
 
 | 项 | 值 | 影响 |
 |---|---|---|
-| `minSdk` | 24 | 不用 `java.time` 之外的新 API；追加写文件足够 |
+| `minSdk` | 24 | 只使用该 API 级别支持的平台能力 |
 | 语言 | Kotlin | 无 JNI |
 | 依赖 | AndroidX（core / lifecycle / work） | 不引 OkHttp、Gson、Room |
-| 进程 | 假定单进程 | 多进程宿主需在每个进程各装一次，本库不做 IPC 汇总 |
+| 进程 | 假定单进程 | 仅在主进程安装；文件锁是进程内锁，不支持多进程共写 |
 | minify | 与宿主一致 | 关闭时堆栈本身可读，符号化不是前置条件 |
 
 ## 3. 模块结构
@@ -57,8 +57,8 @@ monitor/
 |---|---|---|---|
 | 未捕获异常 | `Thread.setDefaultUncaughtExceptionHandler` | `crash` | 记录后必须交给原 handler |
 | WebView 渲染进程死亡 | `WebViewClient.onRenderProcessGone` | `webview_gone` | 宿主在阅读器/内嵌页里接 |
-| 低内存 | `Application.onTrimMemory(TRIM_MEMORY_COMPLETE)` | `low_memory` | 1 小时 1 条，只在前台记 |
-| 业务主动上报 | `MooMonitor.capture(e, extras)` | `handled` | 默认关闭，调用点显式开；每 hash 每天上限 20 条 |
+| 低内存 | `Application.onTrimMemory` | `low_memory` | 前台 `RUNNING_CRITICAL` 或后台 `COMPLETE`，共享 1 小时 1 条的闸；不是任意 `>=` 等级 |
+| 业务主动上报 | `MooMonitor.capture(e, extras)` | `handled` | 默认关闭，调用点显式开；按异常类型与调用点每天上限 20 条；非异常事件按 kind，每天合计上限 100 条 |
 | 主线程卡死 | `AnrWatchdog` | `anr` | M2；8 秒无 pong 记一条，带主线程栈 |
 
 ### 4.1 崩溃处理链
@@ -87,7 +87,11 @@ override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail)
         extras = mapOf("did_crash" to detail.didCrash(),
                        "priority" to detail.rendererPriorityAtExit())
     )
-    return false   // 交回宿主决定重建还是退出
+    // 宿主必须使旧回调失效，并清理已死亡的实例，再恢复页面。
+    (view.parent as? ViewGroup)?.removeView(view)
+    view.destroy()
+    recreate()
+    return true
 }
 ```
 
@@ -99,15 +103,17 @@ SDK 不重建 WebView，那是宿主的界面职责。这条对以 WebView 渲�
 > `frames` 与 `stack` 用同一份文本；`device` / `context` 的静态部分由 `DeviceInfo.Snapshot` 在 `install()` 冻结，
 > 崩溃线程不再查 `StatFs` 与 `ConnectivityManager`。
 
-一条 `crash` 在进程内组装（约 2ms）：
+一条 `crash` 在进程内组装（没有实机耗时保证）：
 
 - `exception.name` = `error.javaClass.name`；`message` 截 8KB；`stack` = `Log.getStackTraceString(error)` 截 32KB。
-- `frames`：解析栈文本，跳过 `java.*` / `android.*` / `kotlin.*` / `kotlinx.*` 帧，保留应用与三方帧（≤60），`app = true` 按宿主 `packageName` 前缀匹配。
+- `frames`：解析同一份脱敏/截断后的栈文本，保留应用、三方与系统帧（≤60）；`app = true` 匹配配置 `inAppPackage + "."`，未填写时回退 `applicationId + "."`，不误认相似包名；debug/QA 后缀与源码 namespace 不同时必须显式填写。
 - `breadcrumbs`：环形缓冲快照（最近 30 条）。
 - `context`：`session_id`、`screen`（`ActivityLifecycleCallbacks` 记录的当前 Activity 类名）、`foreground`、`network`（`ConnectivityManager` 只读 `activeNetworkInfo.type`）、`heap_used/max`、`storage_free`（`StatFs(filesDir)`）。
-- `payload`：`thread`、`uptime_ms`、`is_low_ram`、`dropped`（本地丢弃计数）。
+- `exception.thread` 为脱敏线程名；`payload.uptime_ms` 是从本次 SDK 安装开始的单调时钟间隔，不是设备开机时长。`dropped` 是当前进程观察到的容量/坏行/写入失败丢弃计数，不是永久累计值。
+- `payload` 递归脱敏敏感键/字符串，有深度、共享总节点/字符串预算和 8KB 最终字节预算；未知对象不调用 `toString()`。业务调用点仍不得传入书名、正文、账号等字段。
+- 崩溃记录中的 `network` / `storage_free` 来自启动快照，并非崩溃瞬间测量；`heap_used` / 前后台 / 界面为采集时读取。快照失败时缺字段，不在崩溃线程回退系统查询。
 
-**不进记录**：用户内容、文件路径（除私有目录相对路径）、账号凭据、任何业务数据。`screen` 只放类名，不放书名这类业务字段。
+**不进记录**：用户内容、文件路径中的书名/文件名、账号凭据、任何业务数据。`screen` 只放类名，不放书名这类业务字段。
 
 ## 6. 落盘
 
@@ -119,9 +125,10 @@ SDK 不重建 WebView，那是宿主的界面职责。这条对以 WebView 渲�
 | `crash.jsonl` | 崩溃处理器 | **不参与队列锁**，见下 |
 
 - 崩溃路径单独一个文件、单独一把锁，而且这把锁只被崩溃处理器用。原因：如果崩溃线程恰好正持有队列锁（比如崩溃就发生在写队列时），或另一线程正在重写 2MB 的队列，崩溃处理器会一直等——进程随时被系统杀掉，记录就丢了，最坏情况是 ANR。
-- 下次启动时把 `crash.jsonl` 逐行并入队列，然后清空。
-- 队列上限 200 条 / 2MB。超限时读全文、保留最后 150 条、重写，差额累加到 `dropped`。
-- 读队列时逐行 try-parse，坏行跳过并计入 `dropped`——半行不能拖垮整批。
+- 下次启动时把 `crash.jsonl` 并入队列；先以同目录临时文件 + `fsync` + rename 提交目标，再清空源。目标失败保留源；中途退出后按原始行去重重放，不生成新 event_id。
+- 常规队列上限 200 条 / 2MB；崩溃文件上限 50 条，也受同一字节预算约束。超限保留最近最多 3/4 条数，并继续裁到字节限额；单条超过本地总字节限额直接丢弃。
+- 计数在启动扫描、追加及确认时维护，正常追加不再为每条事件重扫全文。启动修复旧文件超限及半行；重写与确认均用原子替换。
+- 读队列时逐行 try-parse，坏行清理并计入 `dropped`，不占收据位置。发送时保留原始行收据，确认只删除对应行；不能按有效记录数删原始前 N 行，否则坏行/上传期间轮转会误删或重发。
 - 单条写失败（磁盘满、权限）→ 静默丢弃，`dropped++`，不再抛。
 - 崩溃风暴闸：`crash.jsonl` 上限 50 条；同一指纹 1 小时内最多写 10 条。坏版本上线时应用会「启动即崩」，没有这个闸会在一小时内写出上千条同一条崩溃。
 
@@ -129,11 +136,14 @@ SDK 不重建 WebView，那是宿主的界面职责。这条对以 WebView 渲�
 
 ## 7. 上报
 
-- `FlushWorker`：`OneTimeWorkRequest`，`NetworkType.CONNECTED`，唯一任务名 `moo-monitor-flush`，`ExistingWorkPolicy.KEEP`。
-- 触发：启动后 10 秒、`onStop`（退后台）、手动 `flush()`。
-- 批次 ≤50 条 / ≤512KB，先到先发（2026-11-09 已落地：`PayloadLimits.batch` 按累计字节切，第一条再大也单独发，避免卡死队列）。
-- 发送前按指纹分组：同 hash 合并 `count`，只发一条——减少体积，也让服务端增量语义更准。
-- 状态码：`2xx` 删批；`401/403` 清队列并持久化 `disabled`，之后 `install()` 直接返回；`422` 丢批；`429` 读 `Retry-After`；`5xx`/网络错误指数退避（30s、2m、8m、30m），最多 6 次。
+- `FlushWorker`：`OneTimeWorkRequest`，`NetworkType.CONNECTED`，唯一任务名 `moo-monitor-flush`，`APPEND_OR_REPLACE`。进程内合并尚未开始的唤醒；Worker 开始时释放唤醒标记，运行中到来的事件可以排一个后继，避免 KEEP 在完成窗口吞掉唤醒。
+- 触发：启动后 10 秒、采集后 5 秒、退后台与手动 `flush()`。已有待运行任务时合并唤醒，不承诺退后台一定绕过已有初始延迟。每轮最多 3 批，有余量会接续一个新 Worker。
+- 批次 ≤50 条 / ≤512KB，先到先发（2026-11-09 已落地：`PayloadLimits.batch` 按累计字节切，超过服务端 256KB 单条预算的旧记录单独发送，避免卡死队列或拖掉邻近记录）。
+- 不做本地指纹聚合，不改 event_id 或 count；指纹计算与聚合由 cloud 负责。
+- 2xx 必须先验证 `ok=true` 与完整、唯一的逐条 index 回执。saved/created/updated/duplicate/filtered 及明确不可重试的 skipped 才删除；可重试/未知记录保留。坏 JSON、ok=false、缺失/重复 index 均不确认。
+- `401/403` 保留队列、停止采集与发送；禁用标记绑定 endpoint/app/token 的 SHA-256，更换发送身份后可恢复。旧版无身份的布尔禁用标记不再永久封死新版本。
+- `400/413/415/422` 丢当前发送批次；408、其它非成功状态与网络错误保留。禁止自动跳转，以免携带项目凭据跨地址。
+- `429` 解析秒数或 HTTP 日期格式的 Retry-After，持久化最早发送时间；到期前 Worker 可被唤起，但不联网。WorkManager 从 30 秒起按指数退避，6 次重试后保留到下次触发；它不保证精确按秒执行。
 - `HttpURLConnection` 而非 OkHttp：为 200 行上报引一个网络库不划算。连接/读取超时各 10 秒。
 
 ## 8. 脱敏
@@ -142,9 +152,9 @@ SDK 不重建 WebView，那是宿主的界面职责。这条对以 WebView 渲�
 
 | 目标 | 规则 |
 |---|---|
-| 路径 | `/data/user/0/<pkg>/…` → `~/…`；`/storage/emulated/0/…` → `~/sdcard/…` |
+| 路径 | `/data/`、`/storage/`、`/sdcard/`、`/mnt/` 的绝对路径折叠为 `~/[path]`，不保留私有文件名 |
 | URL query | 键名命中 `password|pwd|token|secret|api_key|authorization|sig` → `***` |
-| 消息 | `https?://\S+` → `[url]`；32 位以上 hex/base64 串 → `[blob]` |
+| 消息 | URL → `[url]`；key=value、Bearer、独立 JWT 与长凭据清理；保留长类名/方法名/源码文件名 |
 | 设备标识 | `install_id` = 本地随机 UUID 的 SHA-256；**不用** `ANDROID_ID`，避免与其它上报口径可关联 |
 
 ## 9. 接入
@@ -158,13 +168,14 @@ class HostApp : Application() {
             token = BuildConfig.MOO_MONITOR_TOKEN,
             release = BuildConfig.VERSION_NAME,
             build = BuildConfig.VERSION_CODE.toString(),
-            env = if (BuildConfig.DEBUG) "debug" else "release"
+            env = if (BuildConfig.DEBUG) "debug" else "release",
+            inAppPackage = "com.mooeen.shuhe", // 填宿主源码 namespace
         ))
     }
 }
 ```
 
-界面追踪：宿主在关键 Activity 的 `onResume` 调 `MooMonitor.screen("ReaderActivity")`；不调也行，SDK 会从 `ActivityLifecycleCallbacks` 自动取类名。
+界面追踪：宿主可在关键 Activity 的 `onResume` 调 `MooMonitor.screen("ReaderActivity")`；不调也行，SDK 会从 `ActivityLifecycleCallbacks` 自动取类名。手动入口同时更新当前 screen 与面包屑；只允许类名形状、最多 64 字符。
 
 构建注入 token（不入库）：
 
@@ -174,7 +185,7 @@ buildConfigField("String", "MOO_MONITOR_TOKEN",
 ```
 
 ```bash
-./gradlew assembleRelease -PmooMonitorToken="$(cat /Volumes/dev/build_tokens/shuhe-monitor)"
+./gradlew assembleRelease -PmooMonitorToken=<从本机凭据文件按宿主文档读取>
 ```
 
 ## 10. 分发
@@ -193,16 +204,16 @@ includeBuild("../moo-monitor-android")
 |---|---|
 | 单元 | `AppEventFramesTest` / `AppEventLimitsTest`：帧解析、脱敏、截断后 `frames` 与 `stack` 同源 |
 | 单元 | `MonitorStoreTest`：追加、轮转、`dropped` 计数、半行容错 |
-| 单元 | `UploaderTest`：`Transport` 注入假实现，覆盖 200/401/422/500/超时 + 条数与字节切批 |
+| 单元 | `UploaderTest`：完整/部分/损坏回执、撤权、失败保留、轮转期间确认、条数/字节切批与续传 |
+| 定向 | `HttpTransportTest`：本机临时 HTTP 端口，验证响应体、跳转隔离、429/408 与响应体预算 |
 | 单元 | `PayloadLimitsTest`：UTF-8 字节截断（不切坏代理对）、按字节切批 |
 | 定向 | `CrashHandlerTest`（Robolectric）：装 handler 后抛异常 → 队列有一条 `crash` 且原 handler 被调用；
 采集自身抛异常不影响原链；空 token 不接管；同指纹每小时上限 |
 | 真机 | 宿主里制造崩溃，确认后台 30 秒内出现；断网 3 次启动后恢复上报 |
 
-单测证明不了「进程被杀之前写进去了」，真机必跑。
+单测证明不了「目标设备进程被杀之前写进去了」；真机按用户明确授权的场景另行执行，不由本清单自动启动。
 
-实际测试类与条数见 `HANDOFF.md` §2 / §4（46 条，含 `PayloadLimitsTest`、`AppEventLimitsTest`、`CrashSnapshotTest`、
-`CrashHandlerTest`、`IsoTimeTest`）。
+本次定向验证的命令与结果见 `HANDOFF.md`，不把历史测试条数当成当前事实。
 
 ## 12. 分阶段
 
@@ -214,6 +225,8 @@ includeBuild("../moo-monitor-android")
 
 - 采不到：`ContentProvider` 初始化崩溃（早于 `Application.onCreate`）、系统 ANR 弹窗、被 `SIGKILL`、native 崩溃。
 - 首次启动就崩的包可能一条都发不出去——队列在本地，用户不再打开就永远不发。
-- 墨水屏设备 `onTrimMemory` 触发频繁，所以 `low_memory` 做了 1 小时 1 条的闸，否则会淹掉真正的崩溃。
-- 采集会让崩溃进程多活几十毫秒，极端情况下可能改变系统 tombstone 的时序；这是进程内采集的共性代价，不是本库的缺陷。
-- 多进程宿主：本库不做跨进程汇总，每个进程各发各的（`session_id` 不同，云端会分开聚合）。
+- 低内存回调有 1 小时 1 条的闸。Android 14（API 34）起系统不再发送 RUNNING_CRITICAL / COMPLETE，不能靠这条采集覆盖现代系统 OOM；UI_HIDDEN 也不能当低内存。见 [ComponentCallbacks2](https://developer.android.com/reference/android/content/ComponentCallbacks2)。
+- 崩溃路径仍需栈序列化、限流计数持久化和同步写盘，无法保证 OOM 时成功，也没有实机耗时上界。原子替换保护进程中断，不承诺突然断电时目录元数据的持久性。
+- 多进程宿主不支持共写当前目录，必须只在主进程安装。
+- 主动事件目前仍同步组装/落盘；后台系统限制、长时间离线、200 条队列预算与服务端最近 50 个 event_id 去重窗口都限制送达/计数保证。
+- 宿主必须从系统备份及换机迁移中排除 `sharedpref/moo-monitor.xml` 与 `file/monitor/`；否则安装标识、禁用状态和旧队列可能在另一安装恢复。书禾已配置排除。

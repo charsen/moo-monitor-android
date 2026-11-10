@@ -16,7 +16,8 @@ internal class Uploader(
         data class Sent(val records: Int) : Outcome()
         object Nothing : Outcome()
         object Disabled : Outcome()
-        data class Retry(val reason: String) : Outcome()
+        data class Retry(val reason: String, val afterSeconds: Long = 0) : Outcome()
+        object More : Outcome()
     }
 
     fun flush(maxBatches: Int = 3): Outcome {
@@ -24,7 +25,8 @@ internal class Uploader(
 
         var total = 0
         repeat(maxBatches) {
-            val pending = store.pending(BATCH_RECORDS)
+            val batch = store.readBatch(BATCH_RECORDS)
+            val pending = batch.records
             if (pending.isEmpty()) return if (total > 0) Outcome.Sent(total) else Outcome.Nothing
 
             // 条数与字节先到者为准：一条超长栈不该把同批的其它记录一起拖进 422。
@@ -38,12 +40,15 @@ internal class Uploader(
                     .put("schema", 1))
                 .put("records", JSONArray(records))
 
-            when (val result = transport.post("${config.endpoint}/api/v1/app-errors/intake", config.token, body.toString())) {
+            when (val result = transport.post("${config.endpoint.trimEnd('/')}/api/v1/app-errors/intake", config.token, body.toString())) {
                 is Transport.Result.Ok -> {
-                    // 成功也留一行：现场排「到底发出去没有」时，只有失败日志是不够的。
-                    android.util.Log.d(TAG, "intake ok: ${records.size} 条")
-                    store.dropFirst(records.size)
-                    total += records.size
+                    val confirmed = confirmedIndexes(result.body, records.size)
+                        ?: return Outcome.Retry("invalid response")
+                    if (confirmed.isEmpty()) return Outcome.Retry("partial response")
+                    if (!store.acknowledge(batch, confirmed)) return Outcome.Retry("acknowledgement failed")
+                    android.util.Log.d(TAG, "intake confirmed: ${confirmed.size} 条")
+                    total += confirmed.size
+                    if (confirmed.size < records.size) return Outcome.Retry("partial response")
                 }
                 is Transport.Result.Unauthorized -> {
                     android.util.Log.w(TAG, "intake 被拒(${result.code})：token 无效或撤权，停止发送")
@@ -52,16 +57,39 @@ internal class Uploader(
                 is Transport.Result.Rejected -> {
                     // 格式问题重试也不会成功：丢掉这一批，避免卡住后面的记录。
                     android.util.Log.w(TAG, "intake 格式错误，丢弃 ${records.size} 条")
-                    store.dropFirst(records.size)
+                    if (!store.acknowledge(batch, records.indices.toList())) return Outcome.Retry("acknowledgement failed")
                 }
                 is Transport.Result.Retryable -> {
                     android.util.Log.w(TAG, "intake 稍后重试：${result.reason}")
-                    return Outcome.Retry(result.reason)
+                    return Outcome.Retry(result.reason, result.afterSeconds)
                 }
             }
         }
 
-        return Outcome.Sent(total)
+        return if (store.pending(1).isEmpty()) Outcome.Sent(total) else Outcome.More
+    }
+
+    /** 未确认、重复 index 或形状不完整的响应整批保留；只删除服务端明确终结的记录。 */
+    private fun confirmedIndexes(body: String, count: Int): List<Int>? {
+        return runCatching {
+            val response = JSONObject(body)
+            if (response.opt("ok") != true) return null
+            val results = response.optJSONArray("results") ?: return null
+            if (results.length() != count) return null
+            val seen = HashSet<Int>()
+            val confirmed = ArrayList<Int>()
+            for (i in 0 until results.length()) {
+                val result = results.getJSONObject(i)
+                val index = result.opt("index")
+                if (index !is Int || index !in 0 until count || !seen.add(index)) return null
+                when (result.optString("status")) {
+                    "saved", "created", "updated", "duplicate", "filtered" -> confirmed.add(index)
+                    "skipped" -> if (result.opt("retryable") == false) confirmed.add(index)
+                    else -> return null
+                }
+            }
+            confirmed
+        }.getOrNull()
     }
 
     private companion object {

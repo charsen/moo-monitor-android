@@ -10,6 +10,7 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 门面。宿主只需在 `Application.onCreate` 调一次 [install]。
@@ -24,7 +25,13 @@ object MooMonitor {
     private const val TAG = "MooMonitor"
     private const val WORK_NAME = "moo-monitor-flush"
     private const val PREFS = "moo-monitor"
-    private const val KEY_DISABLED = "disabled"
+    private const val KEY_DISABLED = "disabled_scope"
+    private const val KEY_RETRY_AT = "retry_at"
+    private val throttleLock = Any()
+    private var startedAt = 0L
+    private var previousHandler: Thread.UncaughtExceptionHandler? = null
+    private var crashHandler: Thread.UncaughtExceptionHandler? = null
+    private val workScheduled = AtomicBoolean(false)
     /** 主动上报每类每天上限；崩溃走 [MonitorConfig.crashThrottlePerHour]，不共用。 */
     private const val HANDLED_DAILY_CAP = 20
 
@@ -38,41 +45,45 @@ object MooMonitor {
 
     val installed: Boolean get() = config?.enabled == true && !disabled
 
+    @Synchronized
     fun install(application: Application, config: MonitorConfig) {
-        if (config.token.isBlank()) {
-            if (isDebug(application)) Log.w(TAG, "token 为空，监控已禁用")
-            return
-        }
-        if (this.config != null) return
-        if (isDisabled(application)) {
-            // 服务端曾明确拒绝（401/403）：不要每次启动都再撞一次。
-            if (isDebug(application)) Log.w(TAG, "token 曾被服务端拒绝，监控保持禁用")
-            return
-        }
-
         runCatching {
+            if (!config.enabled || this.config != null || isDisabled(application, config)) return
             val tracker = SessionTracker(application)
             val store = MonitorStore.forApp(application, config)
-            // 崩溃线程只带这份冻结快照，不再做磁盘 IO / Binder；取不到就让它退回实时读取。
-            val frozen = runCatching { DeviceInfo.snapshot(application) }.getOrNull()
-
-            this.config = config
+            // 快照失败时缺字段，不允许在崩溃线程回退到 Binder / StatFs。
+            val frozen = runCatching { DeviceInfo.snapshot(application) }.getOrElse {
+                DeviceInfo.Snapshot(org.json.JSONObject(), "unknown", null, Runtime.getRuntime().maxMemory())
+            }
+            store.mergeCrashIntoQueue()
+            val prefs = application.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val edit = prefs.edit()
+            val hour = (System.currentTimeMillis() / 3_600_000L).toInt()
+            val day = hour / 24
+            prefs.all.forEach { (key, value) ->
+                val bucket = when {
+                    key.startsWith("throttle.") -> hour
+                    key.startsWith("cap.") -> day
+                    else -> null
+                }
+                if (bucket != null && Throttle.parse(value as? String).first != bucket) edit.remove(key)
+            }
+            if (prefs.getString("retry_scope", null) != config.deliveryScope()) {
+                edit.remove(KEY_RETRY_AT).putString("retry_scope", config.deliveryScope())
+            }
+            edit.apply()
+            tracker.onBackground = { schedule(application, delaySeconds = 0) }
+            application.registerActivityLifecycleCallbacks(tracker)
+            startedAt = android.os.SystemClock.elapsedRealtime()
+            installCrashHandler(application, config, tracker, store, frozen)
             this.appContext = application.applicationContext
             this.tracker = tracker
             this.store = store
-            this.uploader = Uploader(config, store, HttpTransport("ShuheAndroid/${config.release}"))
-
-            // 上次崩溃的帧先进队列，再装处理器（顺序反了会漏掉本次启动前的记录）。
-            store.mergeCrashIntoQueue()
-
-            application.registerActivityLifecycleCallbacks(tracker)
-            // 退到后台立刻补发一次：只在启动后等 10 秒的话，用户开一眼就退的崩溃要等下次启动。
-            tracker.onBackground = { schedule(application, delaySeconds = 0) }
-            installCrashHandler(application, config, tracker, store, frozen)
-
+            this.uploader = Uploader(config, store, HttpTransport("MooMonitorAndroid/${BuildInfo.VERSION}"))
+            this.config = config
             schedule(application, delaySeconds = 10)
             Breadcrumbs.add("lifecycle", "app_start")
-        }.onFailure { Log.w(TAG, "安装失败：${it.javaClass.simpleName}") }
+        }.onFailure { runCatching { Log.w(TAG, "安装失败：${it.javaClass.simpleName}") } }
     }
 
     /** 业务主动上报。默认不采样，由调用点自己决定要不要调。 */
@@ -80,8 +91,10 @@ object MooMonitor {
         val cfg = config ?: return
         val ctx = appContext ?: return
         if (!installed) return
-        if (captureThrottled(ctx, "handled|${error.javaClass.name}|${error.message}")) return
         runCatching {
+            // 消息可能含动态 ID；保留调用点区分，避免同一异常类把其他故障的预算耗尽。
+            val frame = error.stackTrace.firstOrNull()
+            if (captureThrottled(ctx, "handled|${error.javaClass.name}|${frame?.className}|${frame?.methodName}")) return
             val t = tracker ?: return
             val record = AppEvent.build(
                 context = ctx,
@@ -105,8 +118,9 @@ object MooMonitor {
         val cfg = config ?: return
         val ctx = appContext ?: return
         if (!installed) return
-        if (captureThrottled(ctx, "$kind|${extras["message"] ?: ""}")) return
         runCatching {
+            if (kind !in setOf("webview_gone", "low_memory", "anr", "hang", "termination", "handled")) return
+            if (captureThrottled(ctx, kind)) return
             val t = tracker ?: return
             val record = AppEvent.build(
                 context = ctx,
@@ -114,7 +128,7 @@ object MooMonitor {
                 tracker = t,
                 kind = kind,
                 name = kind,
-                message = extras["message"]?.toString(),
+                message = extras["message"] as? String,
                 stack = null,
                 threadName = Thread.currentThread().name,
                 extras = extras,
@@ -127,41 +141,52 @@ object MooMonitor {
 
     /** 界面追踪。不调也行，SDK 会从 ActivityLifecycleCallbacks 自动取类名。 */
     fun screen(name: String) {
-        Breadcrumbs.add("screen", name)
+        runCatching { if (installed) tracker?.recordScreen(name) }
     }
 
-    /**
-     * 宿主在 `Application.onTrimMemory` 里转发。只在 COMPLETE 级、前台、1 小时 1 条时记录：
-     * 墨水屏设备触发频繁，不设闸会把真正的崩溃淹掉。
-     */
+    /** 前台 CRITICAL 与后台 COMPLETE 是两套等级；UI_HIDDEN 不代表低内存。 */
     fun onTrimMemory(level: Int) {
-        if (level < android.content.ComponentCallbacks2.TRIM_MEMORY_COMPLETE) return
-        val ctx = appContext ?: return
-        if (!installed) return
-        val prefs = ctx.getSharedPreferences("moo-monitor", Context.MODE_PRIVATE)
-        val hour = System.currentTimeMillis() / 3_600_000
-        if (prefs.getLong("low_memory_hour", -1) == hour) return
-        prefs.edit().putLong("low_memory_hour", hour).apply()
-        capture(kind = "low_memory", extras = mapOf("level" to level))
+        runCatching {
+            val ctx = appContext ?: return
+            if (!installed) return
+            val critical = level == android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL && tracker?.foreground == true
+            if (!critical && level != android.content.ComponentCallbacks2.TRIM_MEMORY_COMPLETE) return
+            synchronized(throttleLock) {
+                val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                val hour = System.currentTimeMillis() / 3_600_000
+                if (prefs.getLong("low_memory_hour", -1) == hour) return
+                prefs.edit().putLong("low_memory_hour", hour).apply()
+            }
+            capture(kind = "low_memory", extras = mapOf("level" to level))
+        }
     }
 
     fun flush() {
         val ctx = appContext ?: return
-        schedule(ctx, delaySeconds = 0)
+        if (installed) schedule(ctx, delaySeconds = 0)
     }
 
     // ---- 供 Worker 调用 ----
 
-    internal fun flushOnce(): Uploader.Outcome {
-        val u = uploader ?: return Uploader.Outcome.Disabled
-        val outcome = u.flush()
+    internal fun flushOnce(): Uploader.Outcome = runCatching {
+        if (!installed) return Uploader.Outcome.Disabled
+        val ctx = appContext ?: return Uploader.Outcome.Disabled
+        val cfg = config ?: return Uploader.Outcome.Disabled
+        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val remaining = prefs.getLong(KEY_RETRY_AT, 0) - System.currentTimeMillis()
+        if (remaining > 0) return Uploader.Outcome.Retry("retry-after", (remaining + 999) / 1000)
+        val outcome = uploader?.flush() ?: return Uploader.Outcome.Disabled
         if (outcome is Uploader.Outcome.Disabled) {
             disabled = true
-            appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                ?.edit()?.putBoolean(KEY_DISABLED, true)?.apply()
+            prefs.edit().putString(KEY_DISABLED, cfg.deliveryScope()).commit()
+        } else if (outcome is Uploader.Outcome.Retry && outcome.afterSeconds > 0) {
+            prefs.edit().putLong(KEY_RETRY_AT, System.currentTimeMillis() + outcome.afterSeconds * 1000).commit()
         }
-        return outcome
-    }
+        outcome
+    }.getOrElse { Uploader.Outcome.Retry(it.javaClass.simpleName) }
+
+    internal fun continueFlush(context: Context) = schedule(context, 0)
+    internal fun beginFlush() { workScheduled.set(false) }
 
     // ---- 内部 ----
 
@@ -172,6 +197,12 @@ object MooMonitor {
      * sandbox 的类加载器），不清就无法在一个测试类里覆盖多种安装场景。生产代码不要调用。
      */
     internal fun resetForTests() {
+        runCatching { (appContext as? Application)?.unregisterActivityLifecycleCallbacks(tracker) }
+        if (Thread.getDefaultUncaughtExceptionHandler() === crashHandler) Thread.setDefaultUncaughtExceptionHandler(previousHandler)
+        crashHandler = null
+        previousHandler = null
+        Breadcrumbs.clear()
+        workScheduled.set(false)
         config = null
         store = null
         tracker = null
@@ -185,13 +216,13 @@ object MooMonitor {
         config: MonitorConfig,
         tracker: SessionTracker,
         store: MonitorStore,
-        snapshot: DeviceInfo.Snapshot?,
+        snapshot: DeviceInfo.Snapshot,
     ) {
-        Thread.setDefaultUncaughtExceptionHandler(
-            chainedCrashHandler(Thread.getDefaultUncaughtExceptionHandler()) { thread, error ->
-                recordCrash(context, config, tracker, store, thread, error, snapshot)
-            }
-        )
+        previousHandler = Thread.getDefaultUncaughtExceptionHandler()
+        crashHandler = chainedCrashHandler(previousHandler) { thread, error ->
+            if (!disabled) recordCrash(context, config, tracker, store, thread, error, snapshot)
+        }
+        Thread.setDefaultUncaughtExceptionHandler(crashHandler)
     }
 
     private fun recordCrash(
@@ -201,7 +232,7 @@ object MooMonitor {
         store: MonitorStore,
         thread: Thread,
         error: Throwable,
-        snapshot: DeviceInfo.Snapshot?,
+        snapshot: DeviceInfo.Snapshot,
     ) {
         val stack = Log.getStackTraceString(error)
         if (throttled(context, config, error, stack)) return
@@ -215,7 +246,7 @@ object MooMonitor {
             message = error.message,
             stack = stack,
             threadName = thread.name,
-            extras = mapOf("uptime_ms" to android.os.SystemClock.elapsedRealtime()),
+            extras = mapOf("uptime_ms" to (android.os.SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0)),
             dropped = store.dropped,
             snapshot = snapshot,
         )
@@ -226,36 +257,39 @@ object MooMonitor {
      * 崩溃风暴闸：坏版本「启动即崩」时，同一指纹一小时能写出上千条。
      * 计数落 SharedPreferences —— 崩溃循环会重启进程，内存计数归零等于没有闸。
      */
-    private fun throttled(context: Context, config: MonitorConfig, error: Throwable, stack: String): Boolean {
+    private fun throttled(context: Context, config: MonitorConfig, error: Throwable, stack: String): Boolean = synchronized(throttleLock) {
         val firstFrame = stack.lineSequence().firstOrNull { it.trimStart().startsWith("at ") }?.trim() ?: ""
         val key = "throttle." + Integer.toHexString((error.javaClass.name + firstFrame).hashCode())
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val bucket = (System.currentTimeMillis() / 3_600_000L).toInt()
         val raw = prefs.getString(key, null)
         if (Throttle.shouldSkip(raw, bucket, config.crashThrottlePerHour)) return true
-        prefs.edit().putString(key, Throttle.next(raw, bucket)).apply()
-        return false
+        prefs.edit().putString(key, Throttle.next(raw, bucket)).commit()
+        false
     }
 
     /**
-     * 主动上报的按天闸：同一类错误（kind + 名称 + 消息）每天最多 [HANDLED_DAILY_CAP] 条。
+     * 主动上报按 kind / 异常类型与调用点每天最多 [HANDLED_DAILY_CAP] 条，总计最多 100 条。
      * 没有这个闸，业务在 catch 里循环报错会把 200 条队列灌满，把真正的崩溃挤出去。
      */
-    private fun captureThrottled(context: Context, key: String): Boolean {
+    private fun captureThrottled(context: Context, key: String): Boolean = synchronized(throttleLock) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val storageKey = "cap." + Integer.toHexString(key.hashCode())
         val bucket = (System.currentTimeMillis() / 86_400_000L).toInt()
         val raw = prefs.getString(storageKey, null)
-        if (Throttle.shouldSkip(raw, bucket, HANDLED_DAILY_CAP)) return true
-        prefs.edit().putString(storageKey, Throttle.next(raw, bucket)).apply()
-        return false
+        val total = prefs.getString("cap.total", null)
+        if (Throttle.shouldSkip(raw, bucket, HANDLED_DAILY_CAP) || Throttle.shouldSkip(total, bucket, 100)) return true
+        prefs.edit().putString(storageKey, Throttle.next(raw, bucket))
+            .putString("cap.total", Throttle.next(total, bucket)).apply()
+        false
     }
 
     /** 服务端明确拒绝过（401/403）：持久化，避免每次启动都再撞一次。 */
-    private fun isDisabled(context: Context): Boolean =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_DISABLED, false)
+    private fun isDisabled(context: Context, config: MonitorConfig): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_DISABLED, null) == config.deliveryScope()
 
     private fun schedule(context: Context, delaySeconds: Long) {
+        if (!workScheduled.compareAndSet(false, true)) return
         runCatching {
             val request = OneTimeWorkRequestBuilder<FlushWorker>()
                 .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
@@ -263,12 +297,9 @@ object MooMonitor {
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                 .build()
             WorkManager.getInstance(context)
-                .enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.KEEP, request)
-        }
+                .enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.APPEND_OR_REPLACE, request)
+        }.onFailure { workScheduled.set(false) }
     }
-
-    private fun isDebug(context: Context): Boolean =
-        (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
 }
 
 /**
@@ -287,11 +318,18 @@ internal fun chainedCrashHandler(
 }
 
 /** 上报任务。成功 / 无数据 / 已禁用都算完成；可重试的失败交给 WorkManager 退避。 */
-class FlushWorker(context: Context, params: androidx.work.WorkerParameters) :
+internal class FlushWorker(context: Context, params: androidx.work.WorkerParameters) :
     androidx.work.Worker(context, params) {
 
-    override fun doWork(): Result = when (val outcome = MooMonitor.flushOnce()) {
-        is Uploader.Outcome.Sent, is Uploader.Outcome.Nothing, is Uploader.Outcome.Disabled -> Result.success()
-        is Uploader.Outcome.Retry -> if (runAttemptCount >= 6) Result.success() else Result.retry()
+    override fun doWork(): Result {
+        MooMonitor.beginFlush()
+        return when (MooMonitor.flushOnce()) {
+            is Uploader.Outcome.Sent, is Uploader.Outcome.Nothing, is Uploader.Outcome.Disabled -> Result.success()
+            is Uploader.Outcome.More -> {
+                MooMonitor.continueFlush(applicationContext)
+                Result.success()
+            }
+            is Uploader.Outcome.Retry -> if (runAttemptCount >= 6) Result.success() else Result.retry()
+        }
     }
 }

@@ -57,6 +57,14 @@ class PayloadLimitsTest {
     }
 
     @Test
+    fun `a record above the server single record limit is isolated from its neighbours`() {
+        val small = JSONObject().put("event_id", "small")
+        val oversized = JSONObject().put("blob", "x".repeat(270_000))
+        assertEquals(listOf(small), PayloadLimits.batch(listOf(small, oversized), 50, PayloadLimits.BATCH_BYTES))
+        assertEquals(listOf(oversized), PayloadLimits.batch(listOf(oversized, small), 50, PayloadLimits.BATCH_BYTES))
+    }
+
+    @Test
     fun `record cap still applies when records are tiny`() {
         val records = (1..60).map { JSONObject().put("i", it) }
         assertEquals(50, PayloadLimits.batch(records, 50, PayloadLimits.BATCH_BYTES).size)
@@ -66,6 +74,20 @@ class PayloadLimitsTest {
     fun `empty input yields empty output`() {
         assertEquals("", PayloadLimits.truncate("", PayloadLimits.MESSAGE_BYTES))
         assertTrue(PayloadLimits.batch(emptyList(), 50, PayloadLimits.BATCH_BYTES).isEmpty())
+    }
+
+    @Test
+    fun `allocation free size matches the actual utf8 encoder`() {
+        for (text in listOf("ascii", "中文😀", "x\uD800y", "\uDC00", "\uD83D\uDE00")) {
+            assertEquals(text.toByteArray(Charsets.UTF_8).size, PayloadLimits.size(text))
+        }
+    }
+
+    @Test
+    fun `tiny budgets never overflow because of the marker`() {
+        for (budget in 0..20) {
+            assertTrue(PayloadLimits.size(PayloadLimits.truncate("😀中 ".repeat(20), budget)) <= budget)
+        }
     }
 
     /** 截断不能留下半个码点：Java 会把孤立代理编码成 '?'，回解后就对不上原文了。 */

@@ -47,6 +47,30 @@ class CrashHandlerTest {
     }
 
     @Test
+    fun `operation breadcrumbs are inert until installed and do not enqueue events`() {
+        MooMonitor.breadcrumb("sync", "reader.identity.ok")
+        assertEquals(0, Breadcrumbs.snapshot().length())
+        MooMonitor.install(app, config())
+        repeat(1000) { MooMonitor.breadcrumb("sync", "reader.identity.ok") }
+        assertEquals(1, (0 until Breadcrumbs.snapshot().length()).count {
+            Breadcrumbs.snapshot().getJSONObject(it).optString("name") == "reader.identity.ok"
+        })
+        val queue = File(app.filesDir, "monitor/queue.jsonl")
+        assertTrue(!queue.exists() || queue.readText().isBlank())
+        MooMonitor.capture(IllegalStateException("synthetic"))
+        val record = JSONObject(queue.readLines().single())
+        assertTrue(record.getJSONArray("breadcrumbs").toString().contains("reader.identity.ok"))
+    }
+
+    @Test
+    fun `memory warnings use an elapsed hour rather than a calendar bucket`() {
+        assertTrue(MooMonitor.memoryWarningAllowed(3_599_999))
+        assertFalse(MooMonitor.memoryWarningAllowed(3_600_000))
+        assertFalse(MooMonitor.memoryWarningAllowed(7_199_998))
+        assertTrue(MooMonitor.memoryWarningAllowed(7_199_999))
+    }
+
+    @Test
     fun `installed handler records the crash and still chains to the previous handler`() {
         val chained = AtomicInteger()
         val fake = Thread.UncaughtExceptionHandler { _, _ -> chained.incrementAndGet() }

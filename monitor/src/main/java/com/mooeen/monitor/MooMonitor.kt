@@ -29,6 +29,7 @@ object MooMonitor {
     private const val KEY_RETRY_AT = "retry_at"
     private val throttleLock = Any()
     private var startedAt = 0L
+    private var lastMemoryWarningAt: Long? = null
     private var previousHandler: Thread.UncaughtExceptionHandler? = null
     private var crashHandler: Thread.UncaughtExceptionHandler? = null
     private val workScheduled = AtomicBoolean(false)
@@ -144,19 +145,19 @@ object MooMonitor {
         runCatching { if (installed) tracker?.recordScreen(name) }
     }
 
+    /** Fixed code labels (e.g. sync / reader.identity.ok), retained with errors only. */
+    fun breadcrumb(type: String, name: String) {
+        runCatching { if (installed) Breadcrumbs.operation(type, name) }
+    }
+
     /** 前台 CRITICAL 与后台 COMPLETE 是两套等级；UI_HIDDEN 不代表低内存。 */
     fun onTrimMemory(level: Int) {
         runCatching {
-            val ctx = appContext ?: return
+            if (appContext == null) return
             if (!installed) return
             val critical = level == android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL && tracker?.foreground == true
             if (!critical && level != android.content.ComponentCallbacks2.TRIM_MEMORY_COMPLETE) return
-            synchronized(throttleLock) {
-                val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                val hour = System.currentTimeMillis() / 3_600_000
-                if (prefs.getLong("low_memory_hour", -1) == hour) return
-                prefs.edit().putLong("low_memory_hour", hour).apply()
-            }
+            if (!memoryWarningAllowed(android.os.SystemClock.elapsedRealtime())) return
             capture(kind = "low_memory", extras = mapOf("level" to level))
         }
     }
@@ -188,6 +189,15 @@ object MooMonitor {
     internal fun continueFlush(context: Context) = schedule(context, 0)
     internal fun beginFlush() { workScheduled.set(false) }
 
+    internal fun memoryWarningAllowed(now: Long): Boolean = synchronized(throttleLock) {
+        // A calendar-hour bucket allows two warnings a millisecond apart at an
+        // hour boundary. Elapsed time also ignores user/NTP wall-clock changes.
+        val last = lastMemoryWarningAt
+        if (last != null && now >= last && now - last < 3_600_000L) return false
+        lastMemoryWarningAt = now
+        true
+    }
+
     // ---- 内部 ----
 
     /**
@@ -202,6 +212,7 @@ object MooMonitor {
         crashHandler = null
         previousHandler = null
         Breadcrumbs.clear()
+        synchronized(throttleLock) { lastMemoryWarningAt = null }
         workScheduled.set(false)
         config = null
         store = null

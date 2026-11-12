@@ -57,9 +57,10 @@ monitor/
 |---|---|---|---|
 | 未捕获异常 | `Thread.setDefaultUncaughtExceptionHandler` | `crash` | 记录后必须交给原 handler |
 | WebView 渲染进程死亡 | `WebViewClient.onRenderProcessGone` | `webview_gone` | 宿主在阅读器/内嵌页里接 |
-| 低内存 | `Application.onTrimMemory` | `low_memory` | 前台 `RUNNING_CRITICAL` 或后台 `COMPLETE`，共享 1 小时 1 条的闸；不是任意 `>=` 等级 |
+| 低内存 | `Application.onTrimMemory` | `low_memory` | 前台 `RUNNING_CRITICAL` 或后台 `COMPLETE`，进程内单调时间 1 小时 1 条；不是任意 `>=` 等级 |
 | 业务主动上报 | `MooMonitor.capture(e, extras)` | `handled` | 默认关闭，调用点显式开；按异常类型与调用点每天上限 20 条；非异常事件按 kind，每天合计上限 100 条 |
 | 主线程卡死 | `AnrWatchdog` | `anr` | M2；8 秒无 pong 记一条，带主线程栈 |
+| 固定代码操作轨迹 | `MooMonitor.breadcrumb(type, name)` | — | 最近30条，只随既有事件携带 |
 
 ### 4.1 崩溃处理链
 
@@ -231,3 +232,13 @@ includeBuild("../moo-monitor-android")
 - 多进程宿主不支持共写当前目录，必须只在主进程安装。
 - 主动事件目前仍同步组装/落盘；后台系统限制、长时间离线、200 条队列预算与服务端最近 50 个 event_id 去重窗口都限制送达/计数保证。
 - 宿主必须从系统备份及换机迁移中排除 `sharedpref/moo-monitor.xml` 与 `file/monitor/`；否则安装标识、禁用状态和旧队列可能在另一安装恢复。书禾已配置排除。
+
+## 固定代码操作轨迹（2026-11-12）
+
+`MooMonitor.breadcrumb(type, name)`只接受宿主写死的代码标签：type为1–16个小写ASCII字母/数字/下划线，首字符为字母；name为最多64字节、2–6段以点连接的同类标识符。整串必须匹配且脱敏不改变原值；URL、空白、换行、数字ID段、凭据及超长值丢弃。SDK不能识别任意伪装成代码标签的业务数据，调用点仍必须使用常量/白名单。
+
+操作轨迹只在内存保留最近30条，沿用既有t/type/name字段。相邻同type/name合并，保留首次时间；不累计次数、不新建事件、不触发网络。原内部屏幕/生命周期入口保留原出现次数语义；事件与count不做本地聚合。
+
+内存警告改为进程内elapsedRealtime满一小时，重启重新开始；不再按持久化日历小时桶判断，避免跨整点或改系统时间重复采集。临界等级/前后台判据与其他事件日上限保持。
+
+取舍参考[Sentry Java Scope](https://github.com/getsentry/sentry-java/blob/812682636b45056f5fd9194b9c8320911d500230/sentry/src/main/java/io/sentry/Scope.java)的有界上下文和错误隔离；不移植全局Tracing、自动请求内容采集或回调插件体系。未改崩溃handler、队列回执或发送协议。

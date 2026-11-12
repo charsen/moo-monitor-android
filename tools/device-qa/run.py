@@ -39,11 +39,11 @@ def main():
     adb = [args.adb, '-s', args.serial]
     results = []
 
-    def command(*parts, check=True):
+    def command(*parts, check=True, include_stderr=False):
         result = subprocess.run([*adb, *parts], capture_output=True, text=True, timeout=30)
         if check:
             assert result.returncode == 0, (parts, result.stdout, result.stderr)
-        return result.stdout.strip()
+        return (result.stdout + (result.stderr if include_stderr else '')).strip()
 
     def mode(value, remaining=0):
         temp = control.with_suffix('.tmp')
@@ -89,7 +89,17 @@ def main():
 
     def action(name):
         nonce = str(uuid.uuid4())
-        command('shell', 'am', 'start', '-n', ACTIVITY, '-f', '0x20000000', '--es', 'qa_action', name, '--es', 'qa_nonce', nonce)
+        # Some devices asynchronously disable newly installed test apps. Re-enable
+        # only this isolated package, and fail on launch errors instead of waiting
+        # a minute for a result from an Activity that never started.
+        for attempt in range(3):
+            command('shell', 'pm', 'enable', PKG)
+            launch = command('shell', 'am', 'start', '-n', ACTIVITY, '-f', '0x20000000', '--es', 'qa_action', name, '--es', 'qa_nonce', nonce, include_stderr=True)
+            if not any(line.startswith('Error') for line in launch.splitlines()):
+                break
+            if attempt == 2:
+                raise AssertionError('QA Activity launch failed: ' + launch)
+            time.sleep(.5)
         if name != 'crash':
             wait('action completed: ' + name, lambda: nonce in private('files/device-qa-result.json'))
 

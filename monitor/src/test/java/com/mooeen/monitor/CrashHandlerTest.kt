@@ -17,6 +17,7 @@ import org.robolectric.Robolectric
 import org.robolectric.annotation.Config
 import java.io.File
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.TimeUnit
 
 /**
  * 崩溃接管链是「加监控不改变宿主行为」的唯一落点，必须在真 handler 上验：
@@ -44,6 +45,90 @@ class CrashHandlerTest {
         // 默认 handler 是 JVM 级别的静态状态，漏了会污染同 sandbox 里的其它测试类。
         Thread.setDefaultUncaughtExceptionHandler(original)
         MooMonitor.resetForTests()
+    }
+
+    @Test
+    fun `recursive descriptions do not create events but later attempts still do`() {
+        MooMonitor.install(app, config())
+        val error = object : RuntimeException() {
+            override val message: String get() {
+                MooMonitor.capture(IllegalArgumentException("nested"))
+                MooMonitor.capture(kind = "handled")
+                return "outer"
+            }
+        }
+        repeat(2) { MooMonitor.capture(error) }
+        val rows = File(app.filesDir, "monitor/queue.jsonl").readLines().map(::JSONObject)
+        assertEquals(2, rows.size)
+        assertTrue(rows.all { it.getJSONObject("exception").getString("message") == "outer" })
+        assertEquals(2, rows.map { it.getString("event_id") }.toSet().size)
+    }
+
+    @Test
+    fun `nonexception extras cannot recursively capture another event`() {
+        MooMonitor.install(app, config())
+        val extras = object : AbstractMap<String, Any?>() {
+            override val entries: Set<Map.Entry<String, Any?>> get() {
+                MooMonitor.capture(IllegalStateException("nested"))
+                return mapOf<String, Any?>("counter" to 1).entries
+            }
+        }
+        MooMonitor.capture(kind = "low_memory", extras = extras)
+        val rows = File(app.filesDir, "monitor/queue.jsonl").readLines().map(::JSONObject)
+        assertEquals(1, rows.size)
+        assertEquals("low_memory", rows.single().getString("kind"))
+    }
+
+    @Test
+    fun `capture can continue after a throwing description`() {
+        MooMonitor.install(app, config())
+        MooMonitor.capture(object : RuntimeException() {
+            override val message: String get() = throw IllegalStateException("synthetic serialization failure")
+        })
+        MooMonitor.capture(IllegalStateException("after"))
+        val rows = File(app.filesDir, "monitor/queue.jsonl").readLines().map(::JSONObject)
+        assertEquals("after", rows.single().getJSONObject("exception").getString("message"))
+    }
+
+    @Test
+    fun `capture guards do not suppress another thread`() {
+        MooMonitor.install(app, config())
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val blocked = object : RuntimeException() {
+            override val message: String get() {
+                entered.countDown()
+                check(release.await(5, TimeUnit.SECONDS))
+                return "outer"
+            }
+        }
+        val worker = Thread { MooMonitor.capture(blocked) }
+        worker.start()
+        try {
+            assertTrue(entered.await(3, TimeUnit.SECONDS))
+            MooMonitor.capture(IllegalArgumentException("other-thread"))
+        } finally { release.countDown(); worker.join(5000) }
+        assertFalse(worker.isAlive)
+        val rows = File(app.filesDir, "monitor/queue.jsonl").readLines().map(::JSONObject)
+        assertEquals(setOf("outer", "other-thread"), rows.map { it.getJSONObject("exception").getString("message") }.toSet())
+    }
+
+    @Test
+    fun `fatal recorder still chains while a normal capture is active`() {
+        val chained = AtomicInteger()
+        Thread.setDefaultUncaughtExceptionHandler { _, _ -> chained.incrementAndGet() }
+        MooMonitor.install(app, config())
+        val sent = java.util.concurrent.atomic.AtomicBoolean(false)
+        MooMonitor.capture(object : RuntimeException() {
+            override val message: String get() {
+                if (sent.compareAndSet(false, true)) Thread.getDefaultUncaughtExceptionHandler()!!
+                    .uncaughtException(Thread.currentThread(), IllegalStateException("synthetic-fatal"))
+                return "outer"
+            }
+        })
+        assertEquals(1, chained.get())
+        assertEquals(1, crashRecords().size)
+        assertEquals(1, File(app.filesDir, "monitor/queue.jsonl").readLines().size)
     }
 
     @Test

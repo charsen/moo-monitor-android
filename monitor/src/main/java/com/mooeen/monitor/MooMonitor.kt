@@ -5,6 +5,7 @@ import android.content.Context
 import android.util.Log
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
+import androidx.work.Data
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
@@ -28,6 +29,7 @@ object MooMonitor {
     private const val KEY_DISABLED = "disabled_scope"
     private const val KEY_RETRY_AT = "retry_at"
     private val throttleLock = Any()
+    private val capturing = ThreadLocal<Boolean>()
     private var startedAt = 0L
     private var lastMemoryWarningAt: Long? = null
     private var previousHandler: Thread.UncaughtExceptionHandler? = null
@@ -92,7 +94,7 @@ object MooMonitor {
         val cfg = config ?: return
         val ctx = appContext ?: return
         if (!installed) return
-        runCatching {
+        guardedCapture {
             // 消息可能含动态 ID；保留调用点区分，避免同一异常类把其他故障的预算耗尽。
             val frame = error.stackTrace.firstOrNull()
             if (captureThrottled(ctx, "handled|${error.javaClass.name}|${frame?.className}|${frame?.methodName}")) return
@@ -119,7 +121,7 @@ object MooMonitor {
         val cfg = config ?: return
         val ctx = appContext ?: return
         if (!installed) return
-        runCatching {
+        guardedCapture {
             if (kind !in setOf("webview_gone", "low_memory", "anr", "hang", "termination", "handled")) return
             if (captureThrottled(ctx, kind)) return
             val t = tracker ?: return
@@ -143,6 +145,18 @@ object MooMonitor {
     /** 界面追踪。不调也行，SDK 会从 ActivityLifecycleCallbacks 自动取类名。 */
     fun screen(name: String) {
         runCatching { if (installed) tracker?.recordScreen(name) }
+    }
+
+    /** Error getters and custom Maps can route their own diagnostics back here.
+     * Skip only same-thread nesting, silently; later attempts and other threads
+     * remain independent. The fatal recorder deliberately does not use this gate.
+     */
+    private inline fun guardedCapture(block: () -> Unit) {
+        runCatching {
+            if (capturing.get() == true) return@runCatching
+            try { capturing.set(true); block() }
+            finally { capturing.remove() }
+        }
     }
 
     /** Fixed code labels (e.g. sync / reader.identity.ok), retained with errors only. */
@@ -174,8 +188,8 @@ object MooMonitor {
         val ctx = appContext ?: return Uploader.Outcome.Disabled
         val cfg = config ?: return Uploader.Outcome.Disabled
         val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val remaining = prefs.getLong(KEY_RETRY_AT, 0) - System.currentTimeMillis()
-        if (remaining > 0) return Uploader.Outcome.Retry("retry-after", (remaining + 999) / 1000)
+        val remaining = RetrySchedule.delayMillis(0, prefs.getLong(KEY_RETRY_AT, 0), System.currentTimeMillis())
+        if (remaining > 0) return Uploader.Outcome.Wait((remaining + 999) / 1000)
         val outcome = uploader?.flush() ?: return Uploader.Outcome.Disabled
         if (outcome is Uploader.Outcome.Disabled) {
             disabled = true
@@ -186,7 +200,8 @@ object MooMonitor {
         outcome
     }.getOrElse { Uploader.Outcome.Retry(it.javaClass.simpleName) }
 
-    internal fun continueFlush(context: Context) = schedule(context, 0)
+    internal fun continueFlush(context: Context, delaySeconds: Long = 0, failedRetries: Int = 0) =
+        schedule(context, delaySeconds, failedRetries)
     internal fun beginFlush() { workScheduled.set(false) }
 
     internal fun memoryWarningAllowed(now: Long): Boolean = synchronized(throttleLock) {
@@ -212,6 +227,7 @@ object MooMonitor {
         crashHandler = null
         previousHandler = null
         Breadcrumbs.clear()
+        capturing.remove()
         synchronized(throttleLock) { lastMemoryWarningAt = null }
         workScheduled.set(false)
         config = null
@@ -299,12 +315,16 @@ object MooMonitor {
     private fun isDisabled(context: Context, config: MonitorConfig): Boolean =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_DISABLED, null) == config.deliveryScope()
 
-    private fun schedule(context: Context, delaySeconds: Long) {
+    private fun schedule(context: Context, delaySeconds: Long, failedRetries: Int = 0) {
+        if (!installed) return
         if (!workScheduled.compareAndSet(false, true)) return
         runCatching {
+            val retryAt = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getLong(KEY_RETRY_AT, 0)
+            val delayMillis = RetrySchedule.delayMillis(delaySeconds, retryAt, System.currentTimeMillis())
             val request = OneTimeWorkRequestBuilder<FlushWorker>()
                 .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-                .setInitialDelay(delaySeconds, TimeUnit.SECONDS)
+                .setInitialDelay(delayMillis, TimeUnit.MILLISECONDS)
+                .setInputData(Data.Builder().putInt(FlushWorker.FAILURE_RETRIES, failedRetries.coerceIn(0, 6)).build())
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                 .build()
             WorkManager.getInstance(context)
@@ -334,13 +354,31 @@ internal class FlushWorker(context: Context, params: androidx.work.WorkerParamet
 
     override fun doWork(): Result {
         MooMonitor.beginFlush()
-        return when (MooMonitor.flushOnce()) {
-            is Uploader.Outcome.Sent, is Uploader.Outcome.Nothing, is Uploader.Outcome.Disabled -> Result.success()
-            is Uploader.Outcome.More -> {
-                MooMonitor.continueFlush(applicationContext)
-                Result.success()
+        return resultFor(MooMonitor.flushOnce(), runAttemptCount, inputData.getInt(FAILURE_RETRIES, 0)) { seconds, retries ->
+            MooMonitor.continueFlush(applicationContext, seconds, retries)
+        }
+    }
+
+    companion object {
+        internal const val FAILURE_RETRIES = "monitor_failure_retries"
+
+        /** Carry actual failures across deferred Workers. Waiting spends none;
+         * repeated 429 responses must still hit the original retry budget.
+         * Fresh producer wakes keep their existing new-round semantics.
+         */
+        internal fun resultFor(outcome: Uploader.Outcome, attempts: Int, inherited: Int,
+                               continuation: (Long, Int) -> Unit): Result {
+            val failures = (attempts.coerceIn(0, 6) + inherited.coerceIn(0, 6)).coerceAtMost(6)
+            return when (outcome) {
+                is Uploader.Outcome.Wait -> { continuation(outcome.afterSeconds.coerceAtLeast(1), failures); Result.success() }
+                is Uploader.Outcome.More -> { continuation(0, 0); Result.success() }
+                is Uploader.Outcome.Retry -> when {
+                    failures >= 6 -> Result.success()
+                    outcome.afterSeconds > 0 -> { continuation(outcome.afterSeconds, failures + 1); Result.success() }
+                    else -> Result.retry()
+                }
+                is Uploader.Outcome.Sent, is Uploader.Outcome.Nothing, is Uploader.Outcome.Disabled -> Result.success()
             }
-            is Uploader.Outcome.Retry -> if (runAttemptCount >= 6) Result.success() else Result.retry()
         }
     }
 }

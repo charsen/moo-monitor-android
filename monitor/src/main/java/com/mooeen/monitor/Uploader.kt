@@ -17,6 +17,8 @@ internal class Uploader(
         object Nothing : Outcome()
         object Disabled : Outcome()
         data class Retry(val reason: String, val afterSeconds: Long = 0) : Outcome()
+        /** Persisted wait window, no HTTP request made. */
+        data class Wait(val afterSeconds: Long) : Outcome()
         object More : Outcome()
     }
 

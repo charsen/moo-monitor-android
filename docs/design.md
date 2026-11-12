@@ -58,7 +58,7 @@ monitor/
 | 未捕获异常 | `Thread.setDefaultUncaughtExceptionHandler` | `crash` | 记录后必须交给原 handler |
 | WebView 渲染进程死亡 | `WebViewClient.onRenderProcessGone` | `webview_gone` | 宿主在阅读器/内嵌页里接 |
 | 低内存 | `Application.onTrimMemory` | `low_memory` | 前台 `RUNNING_CRITICAL` 或后台 `COMPLETE`，进程内单调时间 1 小时 1 条；不是任意 `>=` 等级 |
-| 业务主动上报 | `MooMonitor.capture(e, extras)` | `handled` | 默认关闭，调用点显式开；按异常类型与调用点每天上限 20 条；非异常事件按 kind，每天合计上限 100 条 |
+| 业务主动上报 | `MooMonitor.capture(e, extras)` | `handled` | 调用点显式开；按异常类型与调用点每天20条，非异常事件按kind每天100条；同线程常规重入静默跳过 |
 | 主线程卡死 | `AnrWatchdog` | `anr` | M2；8 秒无 pong 记一条，带主线程栈 |
 | 固定代码操作轨迹 | `MooMonitor.breadcrumb(type, name)` | — | 最近30条，只随既有事件携带 |
 
@@ -145,7 +145,8 @@ SDK 不重建 WebView，那是宿主的界面职责。这条对以 WebView 渲�
 - 2xx 必须先验证 `ok=true` 与完整、唯一的逐条 index 回执。saved/created/updated/duplicate/filtered 及明确不可重试的 skipped 才删除；可重试/未知记录保留。坏 JSON、ok=false、缺失/重复 index 均不确认。
 - `401/403` 保留队列、停止采集与发送；禁用标记绑定 endpoint/app/token 的 SHA-256，更换发送身份后可恢复。旧版无身份的布尔禁用标记不再永久封死新版本。
 - `400/413/415/422` 丢当前发送批次；408、其它非成功状态与网络错误保留。禁止自动跳转，以免携带项目凭据跨地址。
-- `429` 解析秒数或 HTTP 日期格式的 Retry-After，持久化最早发送时间；到期前 Worker 可被唤起，但不联网。WorkManager 从 30 秒起按指数退避，6 次重试后保留到下次触发；它不保证精确按秒执行。
+- `429` 解析秒数或 HTTP 日期格式的 Retry-After，持久化最早发送时间；普通值不缩短，异常超大数值/日期统一限制为十年。新任务的初始延迟同时尊重调用方延迟和持久化截止时间；旧异常截止时间只限制单次唤醒跨度，不改写原值，发送前仍检查。
+- 单纯等待未到期窗口用内部 Wait 结果，不消耗失败次数。真实429按服务端等待接续Worker，并携带累计失败次数；网络等普通失败仍由WorkManager从30秒起指数退避。累计6次重试后保留到下次触发，不能因换Worker而无限重试；成功推进批次后重开预算。新的生产事件触发沿用既有新轮预算。WorkManager不保证精确按秒执行，策略单测不代表实体后台唤醒已验证。
 - `HttpURLConnection` 而非 OkHttp：为 200 行上报引一个网络库不划算。连接/读取超时各 10 秒。
 
 ## 8. 脱敏
@@ -242,3 +243,13 @@ includeBuild("../moo-monitor-android")
 内存警告改为进程内elapsedRealtime满一小时，重启重新开始；不再按持久化日历小时桶判断，避免跨整点或改系统时间重复采集。临界等级/前后台判据与其他事件日上限保持。
 
 取舍参考[Sentry Java Scope](https://github.com/getsentry/sentry-java/blob/812682636b45056f5fd9194b9c8320911d500230/sentry/src/main/java/io/sentry/Scope.java)的有界上下文和错误隔离；不移植全局Tracing、自动请求内容采集或回调插件体系。未改崩溃handler、队列回执或发送协议。
+
+## 常规采集的重入保护
+
+异常message/stackTrace和自定义Map读取可能执行宿主代码，并再次调用capture。原runCatching只能吸收失败，无法阻止嵌套采集产生额外事件和写盘。
+
+两个常规capture入口共享线程局部保护，在读取异常/扩展字段前进入，finally解除；嵌套调用静默跳过，不打印日志、不消耗事件日上限，也不递增dropped。后续正常调用（即使复用同一Throwable）及其他线程仍按原限流规则采集，不按异常对象或hashCode永久去重。异常描述读取失败后，下一次调用仍能记录。
+
+保护不包裹致命异常记录器，不替换原handler、不改变崩溃转交；模拟handler定向测试覆盖了常规采集内触发致命记录仍落盘并调用前任链。没有据此宣称真实OOM或设备崩溃耗时。普通异常属性仍同步读取，这不是属性执行沙箱或超时机制。
+
+参考[Sentry Java回调重入守卫](https://github.com/getsentry/sentry-java/blob/812682636b45056f5fd9194b9c8320911d500230/sentry/src/main/java/io/sentry/util/SentryCallbackReentrancyGuard.java)的线程隔离与静默跳过思路；Sentry限定before回调，本库没有用户event processor，改为保护完整的同步常规采集。

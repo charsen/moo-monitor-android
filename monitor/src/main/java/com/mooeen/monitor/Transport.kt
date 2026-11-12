@@ -62,10 +62,13 @@ internal class HttpTransport(private val userAgent: String) : Transport {
 
     internal fun retryAfter(raw: String?, nowMillis: Long = System.currentTimeMillis()): Long {
         val value = raw?.trim() ?: return 0
-        value.toLongOrNull()?.let { return it.coerceIn(0, (Long.MAX_VALUE - nowMillis.coerceAtLeast(0)) / 1000) }
+        value.toLongOrNull()?.let { return it.coerceIn(0, RetrySchedule.MAX_AFTER_SECONDS) }
+        // Valid delta-seconds may overflow Long. Do not turn a huge server wait
+        // into an invalid date and an early retry.
+        if (value.isNotEmpty() && value.all { it in '0'..'9' }) return RetrySchedule.MAX_AFTER_SECONDS
         return runCatching {
             val date = SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US).parse(value) ?: return 0
-            ((date.time - nowMillis + 999) / 1000).coerceAtLeast(0)
+            (RetrySchedule.delayMillis(0, date.time, nowMillis) + 999) / 1000
         }.getOrDefault(0)
     }
 }

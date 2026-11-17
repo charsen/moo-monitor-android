@@ -8,7 +8,7 @@ plugins {
 
 android {
     namespace = "com.mooeen.monitor"
-    compileSdk = 34
+    compileSdk = 35
 
     // 复合构建（includeBuild）靠 group:name 做依赖替换，宿主写
     // implementation("com.mooeen.monitor:monitor:0.1.0") 即可指向本模块。

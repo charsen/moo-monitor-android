@@ -35,14 +35,13 @@ object MooMonitor {
     private var previousHandler: Thread.UncaughtExceptionHandler? = null
     private var crashHandler: Thread.UncaughtExceptionHandler? = null
     private val workScheduled = AtomicBoolean(false)
-    /** 主动上报每类每天上限；崩溃走 [MonitorConfig.crashThrottlePerHour]，不共用。 */
-    private const val HANDLED_DAILY_CAP = 20
 
     @Volatile private var config: MonitorConfig? = null
     @Volatile private var store: MonitorStore? = null
     @Volatile private var tracker: SessionTracker? = null
     @Volatile private var uploader: Uploader? = null
     @Volatile private var appContext: Context? = null
+    @Volatile private var anrWatchdog: AnrWatchdog? = null
 
     @Volatile private var disabled = false
 
@@ -84,6 +83,19 @@ object MooMonitor {
             this.store = store
             this.uploader = Uploader(config, store, HttpTransport("MooMonitorAndroid/${BuildInfo.VERSION}"))
             this.config = config
+            // 主线程卡死看门狗：前台超过 anrTimeoutMs 无心跳就记一条 anr（带主线程栈）。
+            if (config.anrTimeoutMs > 0) {
+                AnrWatchdog(config.anrTimeoutMs, { tracker.foreground }) { blockedMs, stack ->
+                    capture(
+                        kind = "anr",
+                        extras = mapOf(
+                            "message" to "主线程无响应 ${blockedMs}ms",
+                            "blocked_ms" to blockedMs,
+                        ),
+                        stack = stack,
+                    )
+                }.also { anrWatchdog = it; it.start() }
+            }
             schedule(application, delaySeconds = 10)
             Breadcrumbs.add("lifecycle", "app_start")
         }.onFailure { runCatching { Log.w(TAG, "安装失败：${it.javaClass.simpleName}") } }
@@ -94,10 +106,13 @@ object MooMonitor {
         val cfg = config ?: return
         val ctx = appContext ?: return
         if (!installed) return
+        // 宿主可整体关掉"主动诊断"上报，避免可预期失败(429/timeout)把云端刷成一片 open。
+        if (!cfg.handledDiagnosticsEnabled) return
         guardedCapture {
             // 消息可能含动态 ID；保留调用点区分，避免同一异常类把其他故障的预算耗尽。
             val frame = error.stackTrace.firstOrNull()
-            if (captureThrottled(ctx, "handled|${error.javaClass.name}|${frame?.className}|${frame?.methodName}")) return
+            if (captureThrottled(ctx, "handled|${error.javaClass.name}|${frame?.className}|${frame?.methodName}",
+                    cfg.handledDailyCap, cfg.handledTotalDailyCap)) return
             val t = tracker ?: return
             val record = AppEvent.build(
                 context = ctx,
@@ -116,14 +131,22 @@ object MooMonitor {
         }
     }
 
-    /** 主动记一条非异常事件（渲染进程死亡、低内存等）。 */
-    fun capture(kind: String, extras: Map<String, Any?> = emptyMap()) {
+    /**
+     * 主动记一条非异常事件（渲染进程死亡、低内存、ANR 等）。
+     *
+     * [stack] 会写进记录的 exception.stack（云端详情页的「调用栈」区就展示它）；
+     * ANR 这类没有 Throwable 的信号靠它把主线程栈带上，而不是塞进 payload。
+     */
+    fun capture(kind: String, extras: Map<String, Any?> = emptyMap(), stack: String? = null) {
         val cfg = config ?: return
         val ctx = appContext ?: return
         if (!installed) return
         guardedCapture {
             if (kind !in setOf("webview_gone", "low_memory", "anr", "hang", "termination", "handled")) return
-            if (captureThrottled(ctx, kind)) return
+            if (kind == "handled" && !cfg.handledDiagnosticsEnabled) return
+            // 非异常事件（anr/low_memory/webview_gone…）沿用原语义：每类每天上限=总上限，不受 handled 更严的每类 20 约束。
+            val perCap = if (kind == "handled") cfg.handledDailyCap else cfg.handledTotalDailyCap
+            if (captureThrottled(ctx, kind, perCap, cfg.handledTotalDailyCap)) return
             val t = tracker ?: return
             val record = AppEvent.build(
                 context = ctx,
@@ -132,7 +155,7 @@ object MooMonitor {
                 kind = kind,
                 name = kind,
                 message = extras["message"] as? String,
-                stack = null,
+                stack = stack,
                 threadName = Thread.currentThread().name,
                 extras = extras,
                 dropped = store?.dropped ?: 0,
@@ -222,6 +245,8 @@ object MooMonitor {
      * sandbox 的类加载器），不清就无法在一个测试类里覆盖多种安装场景。生产代码不要调用。
      */
     internal fun resetForTests() {
+        runCatching { anrWatchdog?.stop() }
+        anrWatchdog = null
         runCatching { (appContext as? Application)?.unregisterActivityLifecycleCallbacks(tracker) }
         if (Thread.getDefaultUncaughtExceptionHandler() === crashHandler) Thread.setDefaultUncaughtExceptionHandler(previousHandler)
         crashHandler = null
@@ -296,16 +321,17 @@ object MooMonitor {
     }
 
     /**
-     * 主动上报按 kind / 异常类型与调用点每天最多 [HANDLED_DAILY_CAP] 条，总计最多 100 条。
-     * 没有这个闸，业务在 catch 里循环报错会把 200 条队列灌满，把真正的崩溃挤出去。
+     * 主动上报按 kind / 异常类型与调用点每天限流（上限由 [MonitorConfig.handledDailyCap] /
+     * [MonitorConfig.handledTotalDailyCap] 决定）。没有这个闸，业务在 catch 里循环报错会把
+     * 200 条队列灌满，把真正的崩溃挤出去。
      */
-    private fun captureThrottled(context: Context, key: String): Boolean = synchronized(throttleLock) {
+    private fun captureThrottled(context: Context, key: String, perCap: Int, totalCap: Int): Boolean = synchronized(throttleLock) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val storageKey = "cap." + Integer.toHexString(key.hashCode())
         val bucket = (System.currentTimeMillis() / 86_400_000L).toInt()
         val raw = prefs.getString(storageKey, null)
         val total = prefs.getString("cap.total", null)
-        if (Throttle.shouldSkip(raw, bucket, HANDLED_DAILY_CAP) || Throttle.shouldSkip(total, bucket, 100)) return true
+        if (Throttle.shouldSkip(raw, bucket, perCap) || Throttle.shouldSkip(total, bucket, totalCap)) return true
         prefs.edit().putString(storageKey, Throttle.next(raw, bucket))
             .putString("cap.total", Throttle.next(total, bucket)).apply()
         false
@@ -321,9 +347,14 @@ object MooMonitor {
         runCatching {
             val retryAt = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getLong(KEY_RETRY_AT, 0)
             val delayMillis = RetrySchedule.delayMillis(delaySeconds, retryAt, System.currentTimeMillis())
+            // 退避/限流等待只做"向上"抖动(+0~15%)：多端/多进程同一秒集中重试会再触发 429；
+            // 但绝不能向下抖动——persisted Retry-After 的剩余时间若被缩短就是提前重试。
+            val jittered = if (delayMillis >= 30_000L) {
+                delayMillis + (delayMillis * 0.15 * kotlin.random.Random.nextDouble()).toLong()
+            } else delayMillis
             val request = OneTimeWorkRequestBuilder<FlushWorker>()
                 .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-                .setInitialDelay(delayMillis, TimeUnit.MILLISECONDS)
+                .setInitialDelay(jittered, TimeUnit.MILLISECONDS)
                 .setInputData(Data.Builder().putInt(FlushWorker.FAILURE_RETRIES, failedRetries.coerceIn(0, 6)).build())
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                 .build()

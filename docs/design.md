@@ -58,8 +58,8 @@ monitor/
 | 未捕获异常 | `Thread.setDefaultUncaughtExceptionHandler` | `crash` | 记录后必须交给原 handler |
 | WebView 渲染进程死亡 | `WebViewClient.onRenderProcessGone` | `webview_gone` | 宿主在阅读器/内嵌页里接 |
 | 低内存 | `Application.onTrimMemory` | `low_memory` | 前台 `RUNNING_CRITICAL` 或后台 `COMPLETE`，进程内单调时间 1 小时 1 条；不是任意 `>=` 等级 |
-| 业务主动上报 | `MooMonitor.capture(e, extras)` | `handled` | 调用点显式开；按异常类型与调用点每天20条，非异常事件按kind每天100条；同线程常规重入静默跳过 |
-| 主线程卡死 | `AnrWatchdog` | `anr` | M2；8 秒无 pong 记一条，带主线程栈 |
+| 业务主动上报 | `MooMonitor.capture(e, extras)` | `handled` | 调用点显式开；每类每天默认 20 条、当日总默认 100 条（`MonitorConfig.handledDailyCap`/`handledTotalDailyCap` 可调，<=0 不限）；`handledDiagnosticsEnabled=false` 可整体关闭这类主动诊断；同线程常规重入静默跳过 |
+| 主线程卡死 | `AnrWatchdog` | `anr` | 前台超过 `anrTimeoutMs`（默认 8s）无心跳记一条，带主线程栈；后台与调试器连接时不判定；一次卡死只报一条，恢复后重新计时 |
 | 固定代码操作轨迹 | `MooMonitor.breadcrumb(type, name)` | — | 最近30条，只随既有事件携带 |
 
 ### 4.1 崩溃处理链
@@ -145,7 +145,7 @@ SDK 不重建 WebView，那是宿主的界面职责。这条对以 WebView 渲�
 - 2xx 必须先验证 `ok=true` 与完整、唯一的逐条 index 回执。saved/created/updated/duplicate/filtered 及明确不可重试的 skipped 才删除；可重试/未知记录保留。坏 JSON、ok=false、缺失/重复 index 均不确认。
 - `401/403` 保留队列、停止采集与发送；禁用标记绑定 endpoint/app/token 的 SHA-256，更换发送身份后可恢复。旧版无身份的布尔禁用标记不再永久封死新版本。
 - `400/413/415/422` 丢当前发送批次；408、其它非成功状态与网络错误保留。禁止自动跳转，以免携带项目凭据跨地址。
-- `429` 解析秒数或 HTTP 日期格式的 Retry-After，持久化最早发送时间；普通值不缩短，异常超大数值/日期统一限制为十年。新任务的初始延迟同时尊重调用方延迟和持久化截止时间；旧异常截止时间只限制单次唤醒跨度，不改写原值，发送前仍检查。
+- `429` 解析秒数或 HTTP 日期格式的 Retry-After，持久化最早发送时间；普通值不缩短，异常超大数值/日期统一限制为十年。新任务的初始延迟同时尊重调用方延迟和持久化截止时间；≥30s 的延迟额外加 ±15% 抖动，避免多端/多进程同一秒集中重试再次触发 429；旧异常截止时间只限制单次唤醒跨度，不改写原值，发送前仍检查。
 - 单纯等待未到期窗口用内部 Wait 结果，不消耗失败次数。真实429按服务端等待接续Worker，并携带累计失败次数；网络等普通失败仍由WorkManager从30秒起指数退避。累计6次重试后保留到下次触发，不能因换Worker而无限重试；成功推进批次后重开预算。新的生产事件触发沿用既有新轮预算。WorkManager不保证精确按秒执行，策略单测不代表实体后台唤醒已验证。
 - `HttpURLConnection` 而非 OkHttp：为 200 行上报引一个网络库不划算。连接/读取超时各 10 秒。
 

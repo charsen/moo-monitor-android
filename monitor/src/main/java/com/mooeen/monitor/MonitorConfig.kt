@@ -24,11 +24,26 @@ data class MonitorConfig(
     val crashThrottlePerHour: Int = 10,
     /** 崩溃文件最多留多少条（下次启动并入队列）。 */
     val maxCrashRecords: Int = 50,
+    /** 主动上报(handled)每类每天上限；<=0 表示不限。 */
+    val handledDailyCap: Int = 20,
+    /** 主动上报(handled)每天总上限；<=0 表示不限。 */
+    val handledTotalDailyCap: Int = 100,
+    /**
+     * 是否允许「主动诊断(handled)」上报。
+     *
+     * 宿主把可预期的失败（如同步 429 限流 / timeout）也走 capture() 上报时，云端会按消息聚成
+     * 一条条 open 的 app_error，形成噪音。关掉它可只保留崩溃/低内存/渲染进程死亡/ANR 等硬信号。
+     */
+    val handledDiagnosticsEnabled: Boolean = true,
+    /** 主线程卡死(ANR)看门狗超时毫秒；<=0 关闭看门狗。 */
+    val anrTimeoutMs: Long = 8_000,
     /** 源码 namespace；与 applicationId 不同时显式填写（如 debug/隔离包后缀）。 */
     val inAppPackage: String = "",
 ) {
     init {
         require(maxQueueRecords > 0 && maxQueueBytes > 0 && maxCrashRecords > 0 && crashThrottlePerHour > 0)
+        require(handledDailyCap >= 0 && handledTotalDailyCap >= 0)
+        require(anrTimeoutMs >= 0)
     }
     val enabled: Boolean get() = token.isNotBlank() && endpoint.isNotBlank()
 }

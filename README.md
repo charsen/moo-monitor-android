@@ -84,6 +84,26 @@ token 为空时 SDK 整体禁用，不发任何请求。宿主需要只具备客
 
 书禾 Android（`/Volumes/dev/wwwroot/shuhe`）。
 
+## 符号（Android mapping）上传
+
+开启 R8/minify 后，把 `mapping.txt` 上传到 cloud 的 `app-errors/symbols`（契约见 `moo-scaffold-cloud/docs/app-monitor.md` §6.1）：
+
+```bash
+# 只查某 release 是否已有符号（只读）
+node tools/upload-mapping.mjs --release 0.3.28 --build 37 --check \
+  --token-file /Volumes/dev/build_tokens --token-section "shuhe（安卓版）"
+
+# 上传 mapping.txt
+node tools/upload-mapping.mjs \
+  --mapping app/build/outputs/mapping/release/mapping.txt \
+  --release 0.3.28 --build 37 \
+  --token-file /Volumes/dev/build_tokens --token-section "shuhe（安卓版）"
+```
+
+服务端按 `(project, platform, release, build, kind)` 存一份、同键重传覆盖；Android `kind=mapping`，
+token 需具备 `app_errors` 能力（与原上报 token 共用即可）。当前书禾 `isMinifyEnabled=false`，
+本机没有 mapping 可传；开启 minify 后再接 CI。
+
 ## 仓库与许可
 
 双远端：gitee `charsen/moo-monitor-android`（主）、GitHub `charsen/moo-monitor-android`（镜像）。

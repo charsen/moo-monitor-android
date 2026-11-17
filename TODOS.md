@@ -14,6 +14,6 @@
 ## 后续能力
 
 - [ ] capture() 在宿主导入/解析/同步失败处接线；先限定可上传字段，不能传用户内容或业务凭据。
-- [ ] mapping.txt 上传：等宿主实际开启 minify 再做。
+- [x] mapping.txt 上传工具已提供（`tools/upload-mapping.mjs`），并用真实 android token 验证过 `symbols/check`（ok）与上传（`ok:true`，测试 release `0.0.0-symboltest`）；**待书禾实际开启 minify 后接入 CI 自动上传**（当前 `isMinifyEnabled=false`，无 mapping 文件）。
 - [ ] 多进程支持：**已评估，暂不做**——当前单进程假设（只允许主进程安装，不能让多个进程共写同一文件）；真正的多进程需 IPC 汇总与按进程分文件，成本高，宿主要求保持单进程。
 - [ ] gzip 上报：待 `moo-scaffold-cloud` intake 确认支持 `Content-Encoding: gzip` 后再实现（可显著减小上传体积，但要服务端先支持）。

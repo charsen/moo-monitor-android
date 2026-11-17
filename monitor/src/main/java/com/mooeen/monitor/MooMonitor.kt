@@ -91,8 +91,8 @@ object MooMonitor {
                         extras = mapOf(
                             "message" to "主线程无响应 ${blockedMs}ms",
                             "blocked_ms" to blockedMs,
-                            "stack" to stack,
                         ),
+                        stack = stack,
                     )
                 }.also { anrWatchdog = it; it.start() }
             }
@@ -131,8 +131,13 @@ object MooMonitor {
         }
     }
 
-    /** 主动记一条非异常事件（渲染进程死亡、低内存等）。 */
-    fun capture(kind: String, extras: Map<String, Any?> = emptyMap()) {
+    /**
+     * 主动记一条非异常事件（渲染进程死亡、低内存、ANR 等）。
+     *
+     * [stack] 会写进记录的 exception.stack（云端详情页的「调用栈」区就展示它）；
+     * ANR 这类没有 Throwable 的信号靠它把主线程栈带上，而不是塞进 payload。
+     */
+    fun capture(kind: String, extras: Map<String, Any?> = emptyMap(), stack: String? = null) {
         val cfg = config ?: return
         val ctx = appContext ?: return
         if (!installed) return
@@ -150,7 +155,7 @@ object MooMonitor {
                 kind = kind,
                 name = kind,
                 message = extras["message"] as? String,
-                stack = null,
+                stack = stack,
                 threadName = Thread.currentThread().name,
                 extras = extras,
                 dropped = store?.dropped ?: 0,

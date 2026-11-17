@@ -14,7 +14,7 @@ class MonitorConfigLimitsTest {
         assertEquals(20, c.handledDailyCap)
         assertEquals(100, c.handledTotalDailyCap)
         assertTrue(c.handledDiagnosticsEnabled)
-        assertEquals(8_000L, c.anrTimeoutMs)
+        assertEquals(0L, c.anrTimeoutMs) // ANR 默认关闭，宿主显式开启
     }
 
     @Test

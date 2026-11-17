@@ -35,8 +35,13 @@ data class MonitorConfig(
      * 一条条 open 的 app_error，形成噪音。关掉它可只保留崩溃/低内存/渲染进程死亡/ANR 等硬信号。
      */
     val handledDiagnosticsEnabled: Boolean = true,
-    /** 主线程卡死(ANR)看门狗超时毫秒；<=0 关闭看门狗。 */
-    val anrTimeoutMs: Long = 8_000,
+    /**
+     * 主线程卡死(ANR)看门狗超时毫秒；<=0 关闭。
+     *
+     * **默认 0（关闭）**：ANR 采集是新能力，墨水屏上重排版/解析可能偶发长时间占用主线程，
+     * 未在目标机型验证前不应默认改变线上行为；宿主按需显式设置（如 8000）再开启。
+     */
+    val anrTimeoutMs: Long = 0,
     /** 源码 namespace；与 applicationId 不同时显式填写（如 debug/隔离包后缀）。 */
     val inAppPackage: String = "",
 ) {

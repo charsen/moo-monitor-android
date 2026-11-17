@@ -59,7 +59,7 @@ monitor/
 | WebView 渲染进程死亡 | `WebViewClient.onRenderProcessGone` | `webview_gone` | 宿主在阅读器/内嵌页里接 |
 | 低内存 | `Application.onTrimMemory` | `low_memory` | 前台 `RUNNING_CRITICAL` 或后台 `COMPLETE`，进程内单调时间 1 小时 1 条；不是任意 `>=` 等级 |
 | 业务主动上报 | `MooMonitor.capture(e, extras)` | `handled` | 调用点显式开；每类每天默认 20 条、当日总默认 100 条（`MonitorConfig.handledDailyCap`/`handledTotalDailyCap` 可调，<=0 不限）；`handledDiagnosticsEnabled=false` 可整体关闭这类主动诊断；同线程常规重入静默跳过 |
-| 主线程卡死 | `AnrWatchdog` | `anr` | 前台超过 `anrTimeoutMs`（默认 8s）无心跳记一条，带主线程栈；后台与调试器连接时不判定；一次卡死只报一条，恢复后重新计时 |
+| 主线程卡死 | `AnrWatchdog` | `anr` | **默认关闭**（`anrTimeoutMs=0`），宿主显式设置后：前台超过该值（如 8s）无心跳记一条，带主线程栈；后台与调试器连接时不判定；一次卡死只报一条 |
 | 固定代码操作轨迹 | `MooMonitor.breadcrumb(type, name)` | — | 最近30条，只随既有事件携带 |
 
 ### 4.1 崩溃处理链

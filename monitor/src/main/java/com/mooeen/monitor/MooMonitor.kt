@@ -139,7 +139,9 @@ object MooMonitor {
         guardedCapture {
             if (kind !in setOf("webview_gone", "low_memory", "anr", "hang", "termination", "handled")) return
             if (kind == "handled" && !cfg.handledDiagnosticsEnabled) return
-            if (captureThrottled(ctx, kind, cfg.handledDailyCap, cfg.handledTotalDailyCap)) return
+            // 非异常事件（anr/low_memory/webview_gone…）沿用原语义：每类每天上限=总上限，不受 handled 更严的每类 20 约束。
+            val perCap = if (kind == "handled") cfg.handledDailyCap else cfg.handledTotalDailyCap
+            if (captureThrottled(ctx, kind, perCap, cfg.handledTotalDailyCap)) return
             val t = tracker ?: return
             val record = AppEvent.build(
                 context = ctx,
@@ -314,8 +316,9 @@ object MooMonitor {
     }
 
     /**
-     * 主动上报按 kind / 异常类型与调用点每天最多 [HANDLED_DAILY_CAP] 条，总计最多 100 条。
-     * 没有这个闸，业务在 catch 里循环报错会把 200 条队列灌满，把真正的崩溃挤出去。
+     * 主动上报按 kind / 异常类型与调用点每天限流（上限由 [MonitorConfig.handledDailyCap] /
+     * [MonitorConfig.handledTotalDailyCap] 决定）。没有这个闸，业务在 catch 里循环报错会把
+     * 200 条队列灌满，把真正的崩溃挤出去。
      */
     private fun captureThrottled(context: Context, key: String, perCap: Int, totalCap: Int): Boolean = synchronized(throttleLock) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -339,9 +342,10 @@ object MooMonitor {
         runCatching {
             val retryAt = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getLong(KEY_RETRY_AT, 0)
             val delayMillis = RetrySchedule.delayMillis(delaySeconds, retryAt, System.currentTimeMillis())
-            // 退避/限流等待加 ±15% 抖动：多端或多进程同一秒集中重试会再把出口推到 429。
+            // 退避/限流等待只做"向上"抖动(+0~15%)：多端/多进程同一秒集中重试会再触发 429；
+            // 但绝不能向下抖动——persisted Retry-After 的剩余时间若被缩短就是提前重试。
             val jittered = if (delayMillis >= 30_000L) {
-                (delayMillis * (0.85 + kotlin.random.Random.nextDouble() * 0.30)).toLong()
+                delayMillis + (delayMillis * 0.15 * kotlin.random.Random.nextDouble()).toLong()
             } else delayMillis
             val request = OneTimeWorkRequestBuilder<FlushWorker>()
                 .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())

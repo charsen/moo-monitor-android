@@ -222,7 +222,7 @@ includeBuild("../moo-monitor-android")
 
 - **M1**：崩溃 + WebView + 低内存采集，落盘、上报、cloud 建表与后台。
 - **M2**：`AnrWatchdog`、`capture()` 业务接线示例（导入失败、解析失败、同步异常）。
-- **M3**：`mapping.txt` 上传工具 `tools/upload-mapping.mjs` 已提供（POST `/api/v1/app-errors/symbols`，platform=android、kind=mapping、sha256、file=@mapping.txt，`app_errors` token）。仍需等宿主真的开启 minify 后再实际使用，否则堆栈本身可读，上传是无用功。
+- **M3**：`mapping.txt` 上传工具 `tools/upload-mapping.mjs` 已切换为直传三步（POST `/api/v1/uploads/tickets` 签票据 → 七牛直传 `mapping.txt` → POST `/api/v1/uploads/{upload_id}/confirm`，platform=android、kind=mapping、sha256，`app_errors`/`app_symbols` token；cloud 不接收文件字节）。仍需等宿主真的开启 minify 后再实际使用，否则堆栈本身可读，上传是无用功。
 
 ## 13. 边界
 

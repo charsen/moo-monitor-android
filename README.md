@@ -86,14 +86,18 @@ token 为空时 SDK 整体禁用，不发任何请求。宿主需要只具备客
 
 ## 符号（Android mapping）上传
 
-开启 R8/minify 后，把 `mapping.txt` 上传到 cloud 的 `app-errors/symbols`（契约见 `moo-scaffold-cloud/docs/app-monitor.md` §6.1）：
+开启 R8/minify 后，把 `mapping.txt` 上传到 cloud 符号库。采用「cloud 只签票据、文件直传七牛」的三步契约（见 `moo-scaffold-cloud` 分支 `feat/direct-qiniu-uploads`）：
+
+1. `POST {endpoint}/api/v1/uploads/tickets`（`Authorization: Bearer <token>`）申请票据，得到 `upload_id` / `key` / `region` / 七牛 `token`；
+2. 客户端把 `mapping.txt` 直接 `POST` 到七牛直传域名（`upload.qiniup.com` 或 `upload-<region>.qiniup.com`），不经 cloud；
+3. `POST {endpoint}/api/v1/uploads/{upload_id}/confirm`（`Authorization: Bearer <token>`，`uuids` 可空）确认，返回 `ok=true` 即完成。
 
 ```bash
-# 只查某 release 是否已有符号（只读）
+# 只查某 release 是否已有符号（只读，走 legacy check 端点，需 app_errors 能力）
 node tools/upload-mapping.mjs --release 0.3.28 --build 37 --check \
   --token-file /Volumes/dev/build_tokens --token-section "shuhe（安卓版）"
 
-# 上传 mapping.txt
+# 上传 mapping.txt（自动算 sha256，三步直传）
 node tools/upload-mapping.mjs \
   --mapping app/build/outputs/mapping/release/mapping.txt \
   --release 0.3.28 --build 37 \
@@ -101,8 +105,8 @@ node tools/upload-mapping.mjs \
 ```
 
 服务端按 `(project, platform, release, build, kind)` 存一份、同键重传覆盖；Android `kind=mapping`，
-token 需具备 `app_errors` 能力（与原上报 token 共用即可）。当前书禾 `isMinifyEnabled=false`，
-本机没有 mapping 可传；开启 minify 后再接 CI。
+ticket/confirm 用具备 `app_errors` 或 `app_symbols` 能力的 token（与原上报 token 共用即可）。
+当前书禾 `isMinifyEnabled=false`，本机没有 mapping 可传；开启 minify 后再接 CI。
 
 ## 仓库与许可
 

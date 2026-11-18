@@ -10,6 +10,8 @@ import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -25,6 +27,7 @@ object MooMonitor {
 
     private const val TAG = "MooMonitor"
     private const val WORK_NAME = "moo-monitor-flush"
+    private const val SCHEDULE_STALE_MS = 120_000L
     private const val PREFS = "moo-monitor"
     private const val KEY_DISABLED = "disabled_scope"
     private const val KEY_RETRY_AT = "retry_at"
@@ -35,6 +38,11 @@ object MooMonitor {
     private var previousHandler: Thread.UncaughtExceptionHandler? = null
     private var crashHandler: Thread.UncaughtExceptionHandler? = null
     private val workScheduled = AtomicBoolean(false)
+    @Volatile private var workScheduledAt = 0L
+    /** 普通 capture 的组装/落盘不占调用线程；崩溃写入仍保持同步。 */
+    private val captureWriter: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "moo-monitor-writer").apply { isDaemon = true }
+    }
 
     @Volatile private var config: MonitorConfig? = null
     @Volatile private var store: MonitorStore? = null
@@ -114,20 +122,22 @@ object MooMonitor {
             if (captureThrottled(ctx, "handled|${error.javaClass.name}|${frame?.className}|${frame?.methodName}",
                     cfg.handledDailyCap, cfg.handledTotalDailyCap)) return
             val t = tracker ?: return
-            val record = AppEvent.build(
-                context = ctx,
-                config = cfg,
-                tracker = t,
-                kind = "handled",
-                name = error.javaClass.name,
-                message = error.message,
-                stack = Log.getStackTraceString(error),
-                threadName = Thread.currentThread().name,
-                extras = extras,
-                dropped = store?.dropped ?: 0,
-            )
-            store?.append(record)
-            schedule(ctx, delaySeconds = 5)
+            dispatchCapture {
+                val record = AppEvent.build(
+                    context = ctx,
+                    config = cfg,
+                    tracker = t,
+                    kind = "handled",
+                    name = error.javaClass.name,
+                    message = error.message,
+                    stack = Log.getStackTraceString(error),
+                    threadName = Thread.currentThread().name,
+                    extras = extras,
+                    dropped = store?.dropped ?: 0,
+                )
+                store?.append(record)
+                schedule(ctx, delaySeconds = 5)
+            }
         }
     }
 
@@ -148,20 +158,38 @@ object MooMonitor {
             val perCap = if (kind == "handled") cfg.handledDailyCap else cfg.handledTotalDailyCap
             if (captureThrottled(ctx, kind, perCap, cfg.handledTotalDailyCap)) return
             val t = tracker ?: return
-            val record = AppEvent.build(
-                context = ctx,
-                config = cfg,
-                tracker = t,
-                kind = kind,
-                name = kind,
-                message = extras["message"] as? String,
-                stack = stack,
-                threadName = Thread.currentThread().name,
-                extras = extras,
-                dropped = store?.dropped ?: 0,
-            )
-            store?.append(record)
-            schedule(ctx, delaySeconds = 5)
+            dispatchCapture {
+                val record = AppEvent.build(
+                    context = ctx,
+                    config = cfg,
+                    tracker = t,
+                    kind = kind,
+                    name = kind,
+                    message = extras["message"] as? String,
+                    stack = stack,
+                    threadName = Thread.currentThread().name,
+                    extras = extras,
+                    dropped = store?.dropped ?: 0,
+                )
+                store?.append(record)
+                schedule(ctx, delaySeconds = 5)
+            }
+        }
+    }
+
+    private fun dispatchCapture(block: () -> Unit) {
+        if (config?.asyncCapture == false) {
+            runCatching(block)
+            return
+        }
+        runCatching {
+            captureWriter.execute {
+                runCatching {
+                    // Keep the same-thread reentry guard effective on the writer thread too:
+                    // a custom Throwable.message/Map getter must not spawn nested events.
+                    try { capturing.set(true); block() } finally { capturing.remove() }
+                }
+            }
         }
     }
 
@@ -225,7 +253,7 @@ object MooMonitor {
 
     internal fun continueFlush(context: Context, delaySeconds: Long = 0, failedRetries: Int = 0) =
         schedule(context, delaySeconds, failedRetries)
-    internal fun beginFlush() { workScheduled.set(false) }
+    internal fun beginFlush() { workScheduled.set(false); workScheduledAt = 0L }
 
     internal fun memoryWarningAllowed(now: Long): Boolean = synchronized(throttleLock) {
         // A calendar-hour bucket allows two warnings a millisecond apart at an
@@ -343,7 +371,12 @@ object MooMonitor {
 
     private fun schedule(context: Context, delaySeconds: Long, failedRetries: Int = 0) {
         if (!installed) return
-        if (!workScheduled.compareAndSet(false, true)) return
+        val now = System.currentTimeMillis()
+        // A WorkManager enqueue can theoretically be swallowed by process death or a
+        // cancelled unique-work chain; do not leave the SDK permanently unscheduled.
+        if (workScheduled.get() && now - workScheduledAt < SCHEDULE_STALE_MS) return
+        workScheduled.set(true)
+        workScheduledAt = now
         runCatching {
             val retryAt = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getLong(KEY_RETRY_AT, 0)
             val delayMillis = RetrySchedule.delayMillis(delaySeconds, retryAt, System.currentTimeMillis())
@@ -360,7 +393,7 @@ object MooMonitor {
                 .build()
             WorkManager.getInstance(context)
                 .enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.APPEND_OR_REPLACE, request)
-        }.onFailure { workScheduled.set(false) }
+        }.onFailure { workScheduled.set(false); workScheduledAt = 0L }
     }
 }
 

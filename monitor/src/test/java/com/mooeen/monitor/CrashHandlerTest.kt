@@ -148,6 +148,18 @@ class CrashHandlerTest {
     }
 
     @Test
+    fun `async capture uses writer and still persists`() {
+        MooMonitor.install(app, config(asyncCapture = true))
+        MooMonitor.capture(IllegalStateException("async-writer"))
+        val queue = File(app.filesDir, "monitor/queue.jsonl")
+        repeat(100) {
+            if (queue.exists() && queue.readLines().any { it.contains("async-writer") }) return
+            Thread.sleep(20)
+        }
+        assertTrue("async capture must eventually persist", queue.exists() && queue.readText().contains("async-writer"))
+    }
+
+    @Test
     fun `memory warnings use an elapsed hour rather than a calendar bucket`() {
         assertTrue(MooMonitor.memoryWarningAllowed(3_599_999))
         assertFalse(MooMonitor.memoryWarningAllowed(3_600_000))
@@ -327,6 +339,7 @@ class CrashHandlerTest {
     private fun config(
         token: String = "t",
         crashThrottlePerHour: Int = 10,
+        asyncCapture: Boolean = false,
     ) = MonitorConfig(
         endpoint = "http://127.0.0.1:9",
         token = token,
@@ -335,6 +348,7 @@ class CrashHandlerTest {
         build = "1",
         env = "debug",
         crashThrottlePerHour = crashThrottlePerHour,
+        asyncCapture = asyncCapture,
     )
 
     private fun crashRecords(): List<JSONObject> {

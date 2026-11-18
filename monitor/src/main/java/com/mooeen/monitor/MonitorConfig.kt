@@ -44,6 +44,11 @@ data class MonitorConfig(
     val anrTimeoutMs: Long = 0,
     /** 源码 namespace；与 applicationId 不同时显式填写（如 debug/隔离包后缀）。 */
     val inAppPackage: String = "",
+    /**
+     * 普通 capture/低内存/ANR 的组装与落盘是否放到 SDK 内部单线程 writer。
+     * 崩溃路径始终同步写 crash 文件；测试可设为 false 以保证断言即时可见。
+     */
+    val asyncCapture: Boolean = true,
 ) {
     init {
         require(maxQueueRecords > 0 && maxQueueBytes > 0 && maxCrashRecords > 0 && crashThrottlePerHour > 0)

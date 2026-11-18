@@ -20,6 +20,8 @@ data class MonitorConfig(
     /** 队列上限：条数与字节，先到者为准。 */
     val maxQueueRecords: Int = 200,
     val maxQueueBytes: Int = 2 * 1024 * 1024,
+    /** Normal queue writes fsync after each append; crash records always fsync. */
+    val queueFsync: Boolean = true,
     /** 崩溃风暴闸：同一指纹每小时最多写多少条。 */
     val crashThrottlePerHour: Int = 10,
     /** 崩溃文件最多留多少条（下次启动并入队列）。 */

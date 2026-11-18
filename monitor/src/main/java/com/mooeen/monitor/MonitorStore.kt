@@ -23,7 +23,7 @@ internal class MonitorStore(rootDir: File, private val config: MonitorConfig) {
     data class Batch(val records: List<JSONObject>, internal val lines: List<String>)
 
     fun append(record: JSONObject) = synchronized(queueLock) {
-        queueCount = appendTo(queueFile, record, queueCount, config.maxQueueRecords, sync = false)
+        queueCount = appendTo(queueFile, record, queueCount, config.maxQueueRecords, sync = config.queueFsync)
     }
 
     fun appendCrash(record: JSONObject) = synchronized(crashLock) {

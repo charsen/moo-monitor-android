@@ -63,6 +63,25 @@ function authHeaders(token, extra) {
   return { Authorization: `Bearer ${token}`, ...extra };
 }
 
+// 错误回显脱敏：把 JSON 里 token/authorization/secret/password 类字段替换为 ***，避免把票据打日志。
+const SENSITIVE_KEYS = ['token', 'authorization', 'secret', 'password'];
+function redact(obj) {
+  if (Array.isArray(obj)) return obj.map(redact);
+  if (obj && typeof obj === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(obj)) {
+      out[k] = SENSITIVE_KEYS.some((s) => k.toLowerCase().includes(s)) ? '***' : redact(v);
+    }
+    return out;
+  }
+  return obj;
+}
+// 把响应体转成可安全打印的字符串：能解析 JSON 则脱敏后序列化，否则原文。
+function safeBody(res) {
+  if (res.json && typeof res.json === 'object') return JSON.stringify(redact(res.json));
+  return res.text;
+}
+
 async function readJson(res) {
   const text = await res.text();
   try { return { text, json: JSON.parse(text) }; } catch { return { text, json: null }; }
@@ -77,11 +96,13 @@ const platform = 'android';
 const token = readToken(opts);
 if (!token) { console.error('缺少 token（--token / MOO_MONITOR_TOKEN / --token-file + --token-section）'); process.exit(2); }
 if (!release) { console.error('缺少 --release（versionName）'); process.exit(2); }
+if (!build) { console.error('缺少 --build（versionCode；release+build 是云端定位符号的键）'); process.exit(2); }
 
 async function check() {
   const res = await fetch(`${endpoint}/api/v1/app-errors/symbols/check`, {
     method: 'POST',
     headers: authHeaders(token, { 'Content-Type': 'application/json', Accept: 'application/json' }),
+    signal: AbortSignal.timeout(60000),
     body: JSON.stringify({ platform, release, build, kind }),
   });
   const { text } = await readJson(res);
@@ -89,17 +110,30 @@ async function check() {
   process.exit(res.ok ? 0 : 1);
 }
 
+// 流式计算 sha256，避免把大文件整体读入内存。
+function sha256OfFile(file) {
+  return new Promise((resolve, reject) => {
+    const h = crypto.createHash('sha256');
+    fs.createReadStream(file)
+      .on('data', (chunk) => h.update(chunk))
+      .on('error', reject)
+      .on('end', () => resolve(h.digest('hex')));
+  });
+}
+
 async function upload() {
   const mapping = opts.mapping;
   if (!mapping || !fs.existsSync(mapping)) { console.error('找不到 mapping 文件：' + mapping); process.exit(2); }
-  const bytes = fs.readFileSync(mapping);
-  const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+  const stat = fs.statSync(mapping);
+  if (!stat.size) { console.error('mapping 文件为空：' + mapping); process.exit(2); }
+  const sha256 = await sha256OfFile(mapping);
   const originalName = path.basename(String(mapping)) || 'mapping.txt';
 
   // 1) 签票据：cloud 登记元信息并签发七牛上传 token，不接收文件本体。
   const ticketRes = await fetch(`${endpoint}/api/v1/uploads/tickets`, {
     method: 'POST',
     headers: authHeaders(token, { 'Content-Type': 'application/json', Accept: 'application/json' }),
+    signal: AbortSignal.timeout(60000),  // 60s 超时，防止请求卡死挂住 CI
     body: JSON.stringify({
       business: 'app_symbols',
       platform,
@@ -107,19 +141,19 @@ async function upload() {
       build,
       kind,
       original_name: originalName,
-      file_size: bytes.length,
+      file_size: stat.size,
       sha256,
       uuids: [],
     }),
   });
   const ticket = await readJson(ticketRes);
   if (!ticketRes.ok || !ticket.json || ticket.json.ok !== true) {
-    console.error(`票据申请失败 HTTP ${ticketRes.status}：${ticket.text}`);
+    console.error(`票据申请失败 HTTP ${ticketRes.status}：${safeBody(ticket)}`);
     process.exit(1);
   }
   const { upload_id: uploadId, key, region, token: uploadToken } = ticket.json;
   if (!uploadId || !key || !region || !uploadToken) {
-    console.error('票据响应缺少 upload_id/key/region/token：' + ticket.text);
+    console.error('票据响应缺少 upload_id/key/region/token：' + safeBody(ticket));
     process.exit(1);
   }
   const uploadHost = QINIU_UPLOAD_HOSTS[region];
@@ -130,14 +164,16 @@ async function upload() {
   console.log(`ticket upload_id=${uploadId} region=${region} host=${uploadHost}`);
 
   // 2) 直传七牛：multipart，文件字节只经过本机 -> 七牛，不经过 cloud。
+  // 用 openAsBlob 从磁盘按需读取，避免整文件载入内存。
+  const fileBlob = await fs.openAsBlob(mapping, { type: 'text/plain' });
   const form = new FormData();
   form.append('token', uploadToken);
   form.append('key', key);
-  form.append('file', new Blob([bytes], { type: 'text/plain' }), originalName);
-  const qiniuRes = await fetch(uploadHost, { method: 'POST', body: form });
+  form.append('file', fileBlob, originalName);
+  const qiniuRes = await fetch(uploadHost, { method: 'POST', body: form, signal: AbortSignal.timeout(600000) });  // 大文件直传留 600s
   const qiniu = await readJson(qiniuRes);
   if (!qiniuRes.ok || (qiniu.json && qiniu.json.error)) {
-    console.error(`七牛直传失败 HTTP ${qiniuRes.status}：${qiniu.text}`);
+    console.error(`七牛直传失败 HTTP ${qiniuRes.status}：${safeBody(qiniu)}`);
     process.exit(1);
   }
   console.log('qiniu upload ok');
@@ -146,11 +182,12 @@ async function upload() {
   const confirmRes = await fetch(`${endpoint}/api/v1/uploads/${encodeURIComponent(uploadId)}/confirm`, {
     method: 'POST',
     headers: authHeaders(token, { 'Content-Type': 'application/json', Accept: 'application/json' }),
+    signal: AbortSignal.timeout(60000),  // 60s 超时
     body: JSON.stringify({ uuids: [] }),
   });
   const confirm = await readJson(confirmRes);
   if (!confirmRes.ok || !confirm.json || confirm.json.ok !== true) {
-    console.error(`确认失败 HTTP ${confirmRes.status}：${confirm.text}`);
+    console.error(`确认失败 HTTP ${confirmRes.status}：${safeBody(confirm)}`);
     process.exit(1);
   }
   console.log(`完成：mapping.txt 已直传并确认（release=${release} build=${build || '-'} upload_id=${uploadId}）`);

@@ -48,7 +48,7 @@ monitor/
   src/test/java/com/mooeen/monitor/   纯 JVM 单测 + 2 个 Robolectric 类
 ```
 
-`AnrWatchdog.kt`（M2）尚未存在。`MooMonitor` 之外的类型默认 `internal`，对外只暴露门面 + `MonitorConfig`。
+`AnrWatchdog.kt` 负责前台主线程心跳与卡死报告。`MooMonitor` 之外的类型默认 `internal`，对外只暴露门面 + `MonitorConfig`。
 宿主不应依赖内部结构。
 
 ## 4. 采集点
@@ -59,7 +59,7 @@ monitor/
 | WebView 渲染进程死亡 | `WebViewClient.onRenderProcessGone` | `webview_gone` | 宿主在阅读器/内嵌页里接 |
 | 低内存 | `Application.onTrimMemory` | `low_memory` | 前台 `RUNNING_CRITICAL` 或后台 `COMPLETE`，进程内单调时间 1 小时 1 条；不是任意 `>=` 等级 |
 | 业务主动上报 | `MooMonitor.capture(e, extras)` | `handled` | 调用点显式开；每类每天默认 20 条、当日总默认 100 条（`MonitorConfig.handledDailyCap`/`handledTotalDailyCap` 可调，<=0 不限）；`handledDiagnosticsEnabled=false` 可整体关闭这类主动诊断；同线程常规重入静默跳过 |
-| 主线程卡死 | `AnrWatchdog` | `anr` | **默认关闭**（`anrTimeoutMs=0`），宿主显式设置后：前台超过该值（如 8s）无心跳记一条，带主线程栈；后台与调试器连接时不判定；一次卡死只报一条 |
+| 主线程卡死 | `AnrWatchdog` | `anr` | **默认关闭**（`anrTimeoutMs=0`），宿主显式设置后：前台超过该值（如 8s）无心跳记一条，带主线程栈；后台与调试器连接时不判定；同一主线程心跳只报一条，恢复心跳才重新计时 |
 | 固定代码操作轨迹 | `MooMonitor.breadcrumb(type, name)` | — | 最近30条，只随既有事件携带 |
 
 ### 4.1 崩溃处理链
@@ -108,7 +108,7 @@ SDK 不重建 WebView，那是宿主的界面职责。这条对以 WebView 渲�
 
 - `exception.name` = `error.javaClass.name`；`message` 截 8KB；`stack` = `Log.getStackTraceString(error)` 截 32KB。
 - `frames`：解析同一份脱敏/截断后的栈文本，保留应用、三方与系统帧（≤60）；`app = true` 匹配配置 `inAppPackage + "."`，未填写时回退 `applicationId + "."`，不误认相似包名；debug/QA 后缀与源码 namespace 不同时必须显式填写。
-- `breadcrumbs`：环形缓冲快照（最近 30 条）。
+- `breadcrumbs`：环形缓冲快照（最近 30 条）。普通采集在调用入口固定事件时间、调用线程、界面、前后台和操作轨迹，再由 writer 组装和落盘。网络、堆和磁盘采样发生在组装期间。
 - `context`：`session_id`、`screen`（`ActivityLifecycleCallbacks` 记录的当前 Activity 类名）、`foreground`、`network`（`ConnectivityManager` 只读 `activeNetworkInfo.type`）、`heap_used/max`、`storage_free`（`StatFs(filesDir)`）。
 - `exception.thread` 为脱敏线程名；`payload.uptime_ms` 是从本次 SDK 安装开始的单调时钟间隔，不是设备开机时长。`dropped` 是当前进程观察到的容量/坏行/写入失败丢弃计数，不是永久累计值。
 - `payload` 递归脱敏敏感键/字符串，有深度、共享总节点/字符串预算和 8KB 最终字节预算；未知对象不调用 `toString()`。业务调用点仍不得传入书名、正文、账号等字段。

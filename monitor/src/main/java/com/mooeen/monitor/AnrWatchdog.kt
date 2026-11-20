@@ -53,6 +53,7 @@ internal class AnrWatchdog(
     }
 
     private fun loop() {
+        val stall = AnrStall(timeoutMs)
         while (running) {
             try {
                 Thread.sleep(TICK_MS)
@@ -60,21 +61,34 @@ internal class AnrWatchdog(
                 break
             }
             if (!running) break
-            val gap = SystemClock.elapsedRealtime() - lastTick
-            if (gap < timeoutMs) continue
+            val tick = lastTick
+            val now = SystemClock.elapsedRealtime()
+            if (now - tick < timeoutMs) continue
             if (Debug.isDebuggerConnected()) continue
             if (!runCatching { isForeground() }.getOrDefault(false)) continue
-            // 先重置计时：同一次卡死只报一条；主线程恢复后会重新开始心跳。
-            lastTick = SystemClock.elapsedRealtime()
+            // Only the main thread may advance its heartbeat and rearm reporting.
+            val gap = stall.consume(tick, now) ?: continue
             val main = Looper.getMainLooper().thread
             val stack = runCatching {
                 main.stackTrace.joinToString("\n") { "at $it" }
             }.getOrDefault("")
-            runCatching { onAnr(gap, stack) }
+            if (lastTick == tick) runCatching { onAnr(gap, stack) }
         }
     }
 
     private companion object {
         const val TICK_MS = 1_000L
+    }
+}
+
+/** A stalled main-thread heartbeat is reported once, regardless of how long it lasts. */
+internal class AnrStall(private val timeoutMs: Long) {
+    private var reportedTick: Long? = null
+
+    fun consume(tick: Long, now: Long): Long? {
+        val gap = now - tick
+        if (gap < timeoutMs || reportedTick == tick) return null
+        reportedTick = tick
+        return gap
     }
 }

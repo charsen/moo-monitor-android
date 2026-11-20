@@ -7,6 +7,16 @@ import java.util.UUID
 
 /** 一条上报记录的组装。字段与云端契约（moo-scaffold-cloud/docs/app-monitor.md §4.2）一一对应。 */
 internal object AppEvent {
+    /** Sample volatile UI context before handing work to the asynchronous writer. */
+    data class CaptureContext(
+        val occurredAt: String,
+        val screen: String?,
+        val foreground: Boolean,
+        val breadcrumbs: JSONArray,
+    )
+
+    fun captureContext(tracker: SessionTracker) =
+        CaptureContext(IsoTime.now(), tracker.screen, tracker.foreground, Breadcrumbs.snapshot())
 
     /** 未捕获异常 / 主动上报共用。 */
     fun build(
@@ -22,13 +32,14 @@ internal object AppEvent {
         dropped: Int = 0,
         /** 崩溃路径传启动时冻结的设备快照，避免崩溃线程再做磁盘 IO / Binder 调用。 */
         snapshot: DeviceInfo.Snapshot? = null,
+        capture: CaptureContext = captureContext(tracker),
     ): JSONObject {
         val record = JSONObject()
             .put("event_id", UUID.randomUUID().toString())
             .put("platform", "android")
             .put("kind", kind)
             .put("count", 1)
-            .put("occurred_at", IsoTime.now())
+            .put("occurred_at", capture.occurredAt)
             .put("release", config.release)
             .put("build", config.build)
             .put("env", config.env)
@@ -39,8 +50,8 @@ internal object AppEvent {
         // frames 必须与 exception.stack 是同一份文本：分开截断会让帧对不上栈。
         record.put("frames", frames(safeStack, config.inAppPackage.ifBlank { context.packageName }))
         record.put("device", snapshot?.device ?: DeviceInfo.device(context))
-        record.put("context", DeviceInfo.context(context, tracker, snapshot))
-        record.put("breadcrumbs", Breadcrumbs.snapshot())
+        record.put("context", DeviceInfo.context(context, tracker, capture, snapshot))
+        record.put("breadcrumbs", capture.breadcrumbs)
 
         var payload = Redactor.value(extras) as JSONObject
         if (dropped > 0) payload.put("dropped", dropped)

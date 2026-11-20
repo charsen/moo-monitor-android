@@ -160,6 +160,47 @@ class CrashHandlerTest {
     }
 
     @Test
+    fun `async writer keeps the capture thread screen and breadcrumbs`() {
+        MooMonitor.install(app, config(asyncCapture = true))
+        val writerStarted = java.util.concurrent.CountDownLatch(1)
+        val releaseWriter = java.util.concurrent.CountDownLatch(1)
+        MooMonitor.capture(object : IllegalStateException() {
+            override val message: String get() {
+                writerStarted.countDown()
+                check(releaseWriter.await(5, TimeUnit.SECONDS))
+                return "writer gate"
+            }
+        })
+        val originalThread = Thread.currentThread().name
+        try {
+            assertTrue(writerStarted.await(5, TimeUnit.SECONDS))
+            MooMonitor.screen("BeforeReaderRecovery")
+            MooMonitor.breadcrumb("sync", "reader.identity.failed")
+            MooMonitor.capture("webview_gone")
+            MooMonitor.screen("AfterReaderRecovery")
+            MooMonitor.breadcrumb("sync", "reader.identity.ok")
+        } finally {
+            releaseWriter.countDown()
+        }
+
+        val queue = File(app.filesDir, "monitor/queue.jsonl")
+        val expires = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        var event: JSONObject? = null
+        while (event == null && System.nanoTime() < expires) {
+            event = if (queue.exists()) queue.readLines().mapNotNull {
+                runCatching { JSONObject(it) }.getOrNull()
+            }.firstOrNull { it.optString("kind") == "webview_gone" } else null
+            if (event == null) Thread.sleep(20)
+        }
+        val captured = requireNotNull(event)
+        assertEquals(originalThread, captured.getJSONObject("exception").getString("thread"))
+        assertEquals("BeforeReaderRecovery", captured.getJSONObject("context").getString("screen"))
+        val trail = captured.getJSONArray("breadcrumbs").toString()
+        assertTrue(trail.contains("reader.identity.failed"))
+        assertFalse(trail.contains("reader.identity.ok"))
+    }
+
+    @Test
     fun `memory warnings use an elapsed hour rather than a calendar bucket`() {
         assertTrue(MooMonitor.memoryWarningAllowed(3_599_999))
         assertFalse(MooMonitor.memoryWarningAllowed(3_600_000))

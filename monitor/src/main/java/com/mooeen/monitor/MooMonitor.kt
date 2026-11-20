@@ -122,6 +122,8 @@ object MooMonitor {
             if (captureThrottled(ctx, "handled|${error.javaClass.name}|${frame?.className}|${frame?.methodName}",
                     cfg.handledDailyCap, cfg.handledTotalDailyCap)) return
             val t = tracker ?: return
+            val threadName = Thread.currentThread().name
+            val capture = AppEvent.captureContext(t)
             dispatchCapture {
                 val record = AppEvent.build(
                     context = ctx,
@@ -131,7 +133,8 @@ object MooMonitor {
                     name = error.javaClass.name,
                     message = error.message,
                     stack = Log.getStackTraceString(error),
-                    threadName = Thread.currentThread().name,
+                    threadName = threadName,
+                    capture = capture,
                     extras = extras,
                     dropped = store?.dropped ?: 0,
                 )
@@ -158,6 +161,8 @@ object MooMonitor {
             val perCap = if (kind == "handled") cfg.handledDailyCap else cfg.handledTotalDailyCap
             if (captureThrottled(ctx, kind, perCap, cfg.handledTotalDailyCap)) return
             val t = tracker ?: return
+            val threadName = Thread.currentThread().name
+            val capture = AppEvent.captureContext(t)
             dispatchCapture {
                 val record = AppEvent.build(
                     context = ctx,
@@ -167,7 +172,8 @@ object MooMonitor {
                     name = kind,
                     message = extras["message"] as? String,
                     stack = stack,
-                    threadName = Thread.currentThread().name,
+                    threadName = threadName,
+                    capture = capture,
                     extras = extras,
                     dropped = store?.dropped ?: 0,
                 )

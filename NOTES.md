@@ -1,5 +1,10 @@
 # NOTES
 
+- 2026-11-20：看门狗心跳与 Handler 必须共用 `uptimeMillis()`。原先使用包含深度睡眠的 `elapsedRealtime()`，唤醒时可能把睡眠算进阻塞。现已去掉这类计时误差，定向 JVM 测试通过。Cloud 旧 ANR 聚合的单份 idle 栈无法确定每次历史事件的根因。
+
+- 2026-11-20：BOOX NoteX5Mini / Android 13 上，SDK `3232b5c` 经独立 QA 和本机 Laravel SQLite 共通过 11 个场景。主线程连续阻塞 21,001 ms 只记一条 ANR，真实心跳恢复后第二次阻塞再记一条。异步 writer 受控延迟 1.2 s 时保留调用线程、现场界面、轨迹和时间。崩溃落盘后交还系统并重启补传，限流与 503 用本机夹具。原始断言 `/Volumes/dev/wwwroot/moo-monitor-android/build/monitor-deviceqa-d9j5h10k/results.json`。
+- 2026-11-20：独立 `:device-qa` 模块的 compileSdk 34 低于当前代理依赖要求，构建会报 AAR metadata 错。本次真机包通过临时 Gradle init 将 QA compileSdk 提到 35，同步修正仓库的 QA 构建配置，targetSdk 34 和版本保持。BOOX 第一次自动停用新 QA 包后，按该包的实际 enabled 状态重试并等待真实 Activity 回执。
+
 - 2026-11-12：设备可在安装/清理QA包后异步禁用该包，导致Activity未启动却等待旧结果超时。测试入口只启用指定QA包，检查am start两路输出并有限重试；未启动不能冒充SDK采集失败。
 
 - 2026-11-12：把未到期Retry-After当成失败会空耗Worker次数。等待与真实发送失败须分开；延迟接续任务要携带真实失败数，避免连续429重置预算。超出Long的纯数字等待值不能回落成无效日期后提前重试。

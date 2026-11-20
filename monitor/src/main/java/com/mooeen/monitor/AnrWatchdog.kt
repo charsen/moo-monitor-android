@@ -29,7 +29,9 @@ internal class AnrWatchdog(
 
     private val ticker = object : Runnable {
         override fun run() {
-            lastTick = SystemClock.elapsedRealtime()
+            // Handler delays run on uptime. Counting deep sleep here would
+            // make a sleeping device look like a blocked main thread on wake.
+            lastTick = SystemClock.uptimeMillis()
             if (running) mainHandler.postDelayed(this, TICK_MS)
         }
     }
@@ -37,7 +39,7 @@ internal class AnrWatchdog(
     fun start() {
         if (running || timeoutMs <= 0) return
         running = true
-        lastTick = SystemClock.elapsedRealtime()
+        lastTick = SystemClock.uptimeMillis()
         mainHandler.post(ticker)
         thread = Thread({ loop() }, "moo-anr-watchdog").apply {
             isDaemon = true
@@ -62,7 +64,7 @@ internal class AnrWatchdog(
             }
             if (!running) break
             val tick = lastTick
-            val now = SystemClock.elapsedRealtime()
+            val now = SystemClock.uptimeMillis()
             if (now - tick < timeoutMs) continue
             if (Debug.isDebuggerConnected()) continue
             if (!runCatching { isForeground() }.getOrDefault(false)) continue

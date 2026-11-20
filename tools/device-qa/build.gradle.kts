@@ -5,7 +5,8 @@ plugins {
 
 android {
     namespace = "com.mooeen.monitor.deviceqa"
-    compileSdk = 34
+    // The SDK now depends on AndroidX artifacts whose AAR metadata requires API 35.
+    compileSdk = 35
     defaultConfig {
         applicationId = "com.mooeen.monitor.deviceqa"
         minSdk = 24
